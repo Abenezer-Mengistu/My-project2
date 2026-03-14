@@ -1,0 +1,32 @@
+.venv/
+python-src/.venv/
+__pycache__/
+*.har
+Har/
+python-src/Har/
+*.log
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env
+
+# Others
+.DS_Store
+node_modules/
+dist/
+build/
+
+# Runtime artifacts
+python-src/storage/
+python-src/server.log
+python-src/*.har
+python-src/.~lock.*
+plan.txt
+Event Parking Discovery Pipeline Technical Plan.docx
+*.har
+python-src/Har/
