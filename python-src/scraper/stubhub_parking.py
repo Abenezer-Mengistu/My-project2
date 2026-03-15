@@ -13,6 +13,10 @@ import json
 from scraper.base.ticketing.ticketing_playwright_base import TicketingPlaywrightBase
 from database.repositories.ticketing.parking_passes import get_parking_pass_repository
 from utils.normalization import normalize_lot_name
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent.parent
+STORAGE_DIR = BASE_DIR / 'storage'
+from loguru import logger
 
 
 class StubHubParkingScraper(TicketingPlaywrightBase):
@@ -20,12 +24,46 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
     @staticmethod
     def _currency_from_text(price_text: str) -> str:
-        return "USD"
+        text = (price_text or "").strip()
+        if not text:
+            return ""
+        upper = text.upper()
+        if "USD" in upper or "$" in text:
+            return "USD"
+        if "EUR" in upper or "€" in text:
+            return "EUR"
+        if "GBP" in upper or "£" in text:
+            return "GBP"
+        if "ZAR" in upper or re.search(r"\bR\s?\d", text):
+            return "ZAR"
+        return ""
 
     @staticmethod
     def _numeric_price(price_text: str) -> str | None:
         m = re.search(r"([0-9][0-9,]*(?:\.[0-9]{2})?)", price_text or "")
         return m.group(1).replace(",", "") if m else None
+
+    @staticmethod
+    def _normalize_raw_price(raw_value) -> str | None:
+        """
+        Normalize raw numeric prices that are often returned as integer cents.
+        If the value is an integer-like string with no decimal, treat it as cents
+        when it is >= 100 (e.g. "1222" -> "12.22").
+        """
+        try:
+            s = str(raw_value).strip()
+        except Exception:
+            return None
+        if not s:
+            return None
+        if re.search(r"[.,]", s):
+            return s
+        if not re.fullmatch(r"\d+", s):
+            return s
+        val = int(s)
+        if val >= 100:
+            return f"{val / 100:.2f}"
+        return s
 
     @staticmethod
     def _availability_from_text(text: str) -> str | None:
@@ -78,9 +116,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
     def _price_from_object(obj: dict) -> str | None:
         if not isinstance(obj, dict):
             return None
-        for key in ["formattedPrice", "price", "rawPrice", "listingPrice", "unitPrice"]:
+        for key in ["formattedPrice", "price", "listingPrice", "unitPrice"]:
             if key in obj and obj[key] is not None:
                 return str(obj[key])
+        if obj.get("rawPrice") is not None:
+            normalized = StubHubParkingScraper._normalize_raw_price(obj.get("rawPrice"))
+            if normalized is not None:
+                return str(normalized)
         for key in ["displayPrice", "priceInfo"]:
             if isinstance(obj.get(key), dict):
                 nested = obj[key]
@@ -115,19 +157,44 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     stack.append(v)
         return results
 
+    async def _wait_for_listings(self, timeout_ms: int = 20000) -> bool:
+        """Wait for listing elements or listing count to appear."""
+        selectors = [
+            'div[role="button"].sc-194s59m-4',
+            '[data-testid*="listing"]',
+            'h3',
+            'div:contains("listings")',
+            'div:contains("passes")'
+        ]
+        start = asyncio.get_event_loop().time()
+        while (asyncio.get_event_loop().time() - start) * 1000 < timeout_ms:
+            for s in selectors:
+                try:
+                    if await self.page.locator(s).count() > 0:
+                        return True
+                except Exception:
+                    continue
+            await asyncio.sleep(1)
+        return False
+
     async def _extract_passes_from_dom(self) -> list[dict]:
         async def _extract_from_context(ctx) -> list[dict]:
+            # Updated selectors based on live inspection
             selectors = [
-                'div[data-listing-id]',
+                'div[role="button"].sc-194s59m-4',  # Common listing card pattern
                 '[data-testid*="listing"]',
-                '[data-testid*="listing-card"]',
-                '[data-testid*="ticket"]',
+                'div[data-listing-id]',
+                'div.sc-194s59m-4',
+                '[role="listitem"]',
             ]
             listings = []
             for selector in selectors:
-                listings = await ctx.query_selector_all(selector)
-                if listings:
-                    break
+                try:
+                    listings = await ctx.query_selector_all(selector)
+                    if len(listings) > 2: # Prefer selectors that find multiple items
+                        break
+                except Exception:
+                    continue
 
             passes: list[dict] = []
             seen: set[str] = set()
@@ -135,41 +202,74 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 try:
                     data = await listing.evaluate(
                         """node => {
-                            // Primary price: data-price attribute (e.g. "$166", "$41.50")
-                            const attrPrice = node.getAttribute('data-price') || null;
-
                             const listingId =
                                 node.getAttribute('data-listing-id')
                                 || node.getAttribute('data-listingid')
                                 || node.dataset?.listingId
                                 || null;
 
-                            // Title: h3 inside the listing CTA div
-                            const title = node.querySelector('h3')?.textContent?.trim() || null;
+                            // Title: h3 is very reliable for lot name
+                            const title = node.querySelector('h3')?.textContent?.trim() 
+                                       || node.querySelector('strong')?.textContent?.trim()
+                                       || null;
 
-                            // Availability: sc-1t1b4cp-12 class (contains "1 pass", "1 - 10 passes")
-                            const availEl = node.querySelector('[class*="sc-1t1b4cp-12"]');
-                            const rawAvail = availEl ? availEl.textContent.trim() : null;
+                            // Price: search for currency + digit patterns
+                            let priceText = null;
+                            const priceNodes = Array.from(node.querySelectorAll('div, span, b, p'));
+                            for (const p of priceNodes) {
+                                const t = p.textContent.trim();
+                                if (/^[$€£]\s?[0-9,.]+$/.test(t) || /^[A-Z]{1,3}\s?[0-9,.]+$/.test(t) || /^[0-9,.]+\s?[$€£]/.test(t)) {
+                                    // Verify it's not and availability text
+                                    if (!t.toLowerCase().includes('pass')) {
+                                        priceText = t;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // Specific class fallback for price
+                            if (!priceText) {
+                                const pEl = node.querySelector('[class*="sc-1t1b4cp-1"]');
+                                if (pEl) {
+                                    const t = pEl.textContent.trim();
+                                    if (!t.toLowerCase().includes('pass')) {
+                                        priceText = t;
+                                    }
+                                }
+                            }
 
-                            // Price text: sc-1t1b4cp-1 class (the "$166" text node)
-                            const priceEl = node.querySelector('[class*="sc-1t1b4cp-1"]');
-                            const priceText = priceEl ? priceEl.textContent.trim() : null;
+                            // If still no price, try regex on all text nodes but ignore passes
+                            if (!priceText) {
+                                for (const p of priceNodes) {
+                                    const t = p.textContent.trim();
+                                    const match = t.match(/([$€£]\s?[0-9,.]+|[0-9,.]+\s?[$€£]|[A-Z]{2,3}\s?[0-9,.]+)/);
+                                    if (match && !t.toLowerCase().includes('pass')) {
+                                        priceText = match[0];
+                                        break;
+                                    }
+                                }
+                            }
 
-                            // Rating: sc-j0edf5-4 (e.g. "Amazing", "Great")
-                            const ratingEl = node.querySelector('[class*="sc-j0edf5-4"]');
-                            const rating = ratingEl ? ratingEl.textContent.trim() : null;
+                            // Availability
+                            let rawAvail = null;
+                            const availNodes = Array.from(node.querySelectorAll('div, span'));
+                            for (const a of availNodes) {
+                                const t = a.textContent.toLowerCase();
+                                if (t.includes('pass') || t.includes('passes')) {
+                                    rawAvail = a.textContent.trim();
+                                    break;
+                                }
+                            }
 
-                            // Notes: secondary text like "Last pass", "Buyer could receive different lot"
-                            const noteEl = node.querySelector('[class*="sc-fxFQKK"]');
-                            const notes = noteEl ? noteEl.textContent.trim() : null;
+                            // Rating & Notes
+                            const rating = node.querySelector('[class*="Amazing"], [class*="Great"], [class*="Good"]')?.textContent?.trim() || null;
+                            const notes = Array.from(node.querySelectorAll('div')).map(d => d.textContent.trim()).find(t => t.includes('walk') || t.includes('mi from venue')) || null;
 
-                            // Fallback full text
                             const text = (node.innerText || node.textContent || '').trim();
 
                             return {
                                 listingId,
                                 title,
-                                attrPrice,
                                 priceText,
                                 rawAvail,
                                 rating,
@@ -187,20 +287,29 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 listing_id = data.get("listingId")
                 title = data.get("title")
                 text = data.get("text") or ""
+                price_text = data.get("priceText") or ""
 
-                # Price: prefer data-price attr, then sc-1t1b4cp-1 text, then regex on full text
-                price_raw = data.get("attrPrice") or data.get("priceText") or text
-                price_match = re.search(r"[$€£]\s?([0-9][0-9,]*(?:\.[0-9]{1,2})?)", price_raw)
+                # Robust price extraction
+                price_match = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)", price_text)
+                if not price_match and text:
+                    price_match = re.search(r"[$€£]\s?([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
+                
                 if not price_match:
                     continue
+                
                 price = price_match.group(1).replace(",", "")
+                currency = self._currency_from_text(price_text or text)
+                # Ensure two decimal places for consistency
+                if "." not in price:
+                    price = f"{price}.00"
 
                 availability = self._availability_from_text(data.get("rawAvail") or text)
 
                 lot_name = title
                 if not lot_name:
-                    first_line = text.splitlines()[0].strip()
-                    lot_name = first_line[:120] if first_line else None
+                    first_lines = [l.strip() for l in text.splitlines() if l.strip()]
+                    lot_name = first_lines[0][:120] if first_lines else None
+                
                 if not lot_name:
                     continue
 
@@ -214,13 +323,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "lot_name": lot_name,
                         "normalized_lot_name": normalize_lot_name(lot_name),
                         "price": price,
-                        "currency": "USD",
+                        "currency": currency or None,
                         "availability": availability,
                         "listing_id": listing_id,
                         "listing_details": {
                             "title": lot_name,
-                            "price_incl_fees": data.get("attrPrice") or data.get("priceText"),
-                            "availability": data.get("rawAvail"),
+                            "price_incl_fees": price_text or f"${price}",
+                            "availability": availability,
                             "rating": data.get("rating"),
                             "notes": data.get("notes"),
                         },
@@ -228,7 +337,23 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 )
             return passes
 
+        # First, wait for dynamic content
+        logger.info(f"[Scraper] Waiting for listings on {self.page.url}")
+        is_ready = await self._wait_for_listings()
+        logger.info(f"[Scraper] Listings ready status: {is_ready}")
+        
+        # Capture screenshot for debugging
+        debug_ss_path = STORAGE_DIR / f"debug_phase2_{int(asyncio.get_event_loop().time())}.png"
+        try:
+            await self.page.screenshot(path=str(debug_ss_path))
+            logger.info(f"[Scraper] Debug screenshot saved to {debug_ss_path}")
+        except Exception as e:
+            logger.warning(f"[Scraper] Failed to save debug screenshot: {e}")
+
+        await self.human_delay()
+
         passes = await _extract_from_context(self.page)
+        logger.info(f"[Scraper] DOM extraction found {len(passes or [])} passes")
         if passes:
             return passes
 
@@ -242,6 +367,86 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             if passes:
                 return passes
 
+        # Fallback: scan for listing panels that include a price + "incl. fees".
+        try:
+            panel_cards = await self.page.evaluate(
+                """() => {
+                    const priceRe = /[$€£R]\\s?\\d/;
+                    const feeRe = /incl\\.?\\s*fees/i;
+                    const nodes = Array.from(document.querySelectorAll('div,li,article'));
+                    const out = [];
+                    const seen = new Set();
+                    for (const node of nodes) {
+                        const text = (node.innerText || '').trim();
+                        if (!text) continue;
+                        if (!priceRe.test(text) || !feeRe.test(text)) continue;
+                        // Find a reasonable container for the listing card.
+                        let cur = node;
+                        for (let i = 0; i < 4 && cur && cur.parentElement; i++) {
+                            const t = (cur.innerText || '').trim();
+                            const lines = t.split(/\\n+/).filter(Boolean);
+                            if (lines.length >= 2 && lines.length <= 12) break;
+                            cur = cur.parentElement;
+                        }
+                        if (!cur) continue;
+                        const cText = (cur.innerText || '').trim();
+                        if (!cText) continue;
+                        const cLines = cText.split(/\\n+/).filter(Boolean);
+                        if (cLines.length < 2 || cLines.length > 12) continue;
+                        const heading =
+                            (cur.querySelector('h1,h2,h3,h4,strong')?.textContent || '').trim() || null;
+                        const listingId =
+                            cur.getAttribute('data-listing-id')
+                            || cur.getAttribute('data-listingid')
+                            || cur.dataset?.listingId
+                            || null;
+                        const key = (listingId || '') + '|' + cLines[0] + '|' + cLines[1];
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        out.push({text: cText, heading, listingId});
+                    }
+                    return out;
+                }"""
+            )
+        except Exception:
+            panel_cards = []
+
+        if panel_cards:
+            passes = []
+            seen = set()
+            for data in panel_cards:
+                text = data.get("text") or ""
+                heading = data.get("heading")
+                # Detect symbol like '$', '€', '£', or 'R'
+                price_match = re.search(r"([$€£R])\\s?([0-9][0-9,]*(?:\\.[0-9]{2})?)", text)
+                if not price_match:
+                    continue
+                
+                symbol = price_match.group(1)
+                price = price_match.group(2).replace(",", "")
+                availability = self._availability_from_text(text)
+                lot_name = heading or text.splitlines()[0].strip()[:120]
+                listing_id = data.get("listingId")
+                currency_code = self._currency_from_text(symbol) or self._currency_from_text(text)
+                
+                dedup_key = f"{listing_id}" if listing_id else f"{lot_name}|{price}|{currency_code}|{availability}"
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                passes.append(
+                    {
+                        "lot_name": lot_name,
+                        "normalized_lot_name": normalize_lot_name(lot_name),
+                        "price": price,
+                        "currency": currency_code or None,
+                        "availability": availability,
+                        "listing_id": listing_id,
+                        "details": text if len(text) < 500 else text[:500] + "...",
+                    }
+                )
+            if passes:
+                return passes
+
         # Fallback: fuzzy DOM scan for listing-like cards.
         try:
             raw_cards = await self.page.evaluate(
@@ -251,8 +456,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     for (const node of nodes) {
                         const text = (node.innerText || '').trim();
                         if (!text) continue;
-                        if (!text.includes('$') || !text.toLowerCase().includes('pass')) continue;
-                        if (!text.toLowerCase().includes('incl. fees') && !text.toLowerCase().includes('incl fees')) continue;
+                        if (!/[$€£R]/.test(text)) continue;
                         const lines = text.split(/\\n+/).filter(Boolean);
                         if (lines.length > 10) continue;
                         const heading = (node.querySelector('h1,h2,h3,h4,strong')?.textContent || '').trim() || null;
@@ -277,11 +481,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             price_match = re.search(r"([$€£])\s?([0-9][0-9,]*(?:\.[0-9]{2})?)", text)
             if not price_match:
                 continue
+            symbol = price_match.group(1)
             price = price_match.group(2).replace(",", "")
             availability = self._availability_from_text(text)
             lot_name = heading or text.splitlines()[0].strip()[:120]
             listing_id = data.get("listingId")
-            dedup_key = f"{listing_id}" if listing_id else f"{lot_name}|{price}|USD|{availability}"
+            currency_code = self._currency_from_text(symbol) or self._currency_from_text(text)
+            dedup_key = f"{listing_id}" if listing_id else f"{lot_name}|{price}|{currency_code}|{availability}"
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
@@ -290,7 +496,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "lot_name": lot_name,
                     "normalized_lot_name": normalize_lot_name(lot_name),
                     "price": price,
-                    "currency": "USD",
+                    "currency": currency_code or None,
                     "availability": availability,
                     "listing_id": listing_id,
                     "details": text if len(text) < 500 else text[:500] + "...",
@@ -348,7 +554,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "lot_name": lot_name,
                     "normalized_lot_name": normalize_lot_name(lot_name),
                     "price": price,
-                    "currency": "USD",
+                    "currency": None,
                     "availability": availability,
                     "listing_id": listing_id,
                     "_source": "state",
@@ -397,7 +603,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "lot_name": lot_name,
                     "normalized_lot_name": normalize_lot_name(lot_name),
                     "price": price,
-                    "currency": "USD",
+                    "currency": None,
                     "availability": availability,
                     "listing_id": listing_id,
                     "_source": "payload_json",
@@ -425,7 +631,11 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             listing_id = m.group("listing")
             formatted = m.group("formatted")
             section = m.group("section")
-            price = StubHubParkingScraper._numeric_price(formatted) or m.group("raw")
+            price = (
+                StubHubParkingScraper._numeric_price(formatted)
+                or StubHubParkingScraper._normalize_raw_price(m.group("raw"))
+            )
+            currency = StubHubParkingScraper._currency_from_text(formatted)
             availability = m.group("avail") or None
             dedup_key = f"listing:{listing_id}"
             if dedup_key in seen:
@@ -437,7 +647,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "lot_name": lot,
                     "normalized_lot_name": normalize_lot_name(lot),
                     "price": price,
-                    "currency": "USD",
+                    "currency": currency or None,
                     "availability": availability,
                     "listing_id": listing_id,
                     "_source": source,
@@ -455,6 +665,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             price = StubHubParkingScraper._numeric_price(price_text)
             if not price:
                 continue
+            currency = StubHubParkingScraper._currency_from_text(price_text)
             dedup_key = f"section:{section}|price:{price}"
             if dedup_key in seen:
                 continue
@@ -465,7 +676,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "lot_name": lot,
                     "normalized_lot_name": normalize_lot_name(lot),
                     "price": price,
-                    "currency": "USD",
+                    "currency": currency or None,
                     "availability": None,
                     "_source": source,
                 }
@@ -487,9 +698,10 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             price_text = formatted_m.group("formatted") if formatted_m else ""
             price = StubHubParkingScraper._numeric_price(price_text) if price_text else None
             if not price and raw_m:
-                price = raw_m.group("raw")
+                price = StubHubParkingScraper._normalize_raw_price(raw_m.group("raw"))
             if not price:
                 continue
+            currency = StubHubParkingScraper._currency_from_text(price_text)
 
             lot_name = f"Section {section_m.group('section')}" if section_m else f"Listing {listing_id}"
             dedup_key = f"listing:{listing_id}"
@@ -502,7 +714,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "lot_name": lot_name,
                     "normalized_lot_name": normalize_lot_name(lot_name),
                     "price": price,
-                    "currency": "USD",
+                    "currency": currency or None,
                     "availability": (avail_m.group("avail") if avail_m else None),
                     "listing_id": listing_id,
                     "_source": f"{source}_loose",
@@ -552,28 +764,52 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
             self.page.on("response", lambda resp: asyncio.create_task(_capture_response(resp)))
             self.page.on("request", _capture_request)
+            logger.info(f"[Scraper] Navigating to {url}")
             try:
-                await self.page.goto(url, wait_until="networkidle", timeout=60000)
-            except Exception:
-                await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await self.human_delay()
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                logger.warning(f"[Scraper] Initial goto failed/timed out: {e}")
+                await self.page.goto(url, wait_until="commit", timeout=45000)
+            
+            logger.info(f"[Scraper] Navigation complete. Waiting for stabilization...")
             await self.human_delay()
             await asyncio.sleep(2)
             
             # Handle "Show more" button and lazy loading
+            logger.info("[Scraper] Checking for 'Show more' buttons...")
             try:
-                for _ in range(15):  # Safety limit for clicking Show More
-                    show_more = self.page.get_by_role("button", name="Show more")
+                for i in range(15):  # Safety limit for clicking Show More
+                    show_more = self.page.get_by_role("button", name=re.compile("Show more", re.IGNORECASE))
                     if await show_more.is_visible():
+                        logger.info(f"[Scraper] Clicking 'Show more' (iteration {i+1})...")
                         await show_more.click()
                         await asyncio.sleep(1.5)
                     else:
                         break
                 
                 # Final scroll to trigger hidden elements
-                for _ in range(5):
+                logger.info("[Scraper] Performing final scrolls...")
+                for i in range(5):
                     await self.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(0.5)
                     await asyncio.sleep(1.0)
+
+                # Scroll inside listings panel if it's virtualized
+                for _ in range(10):
+                    await self.page.evaluate(
+                        """() => {
+                            const candidates = [
+                              document.querySelector('[data-testid*="list"]'),
+                              document.querySelector('[data-testid*="listings"]'),
+                              document.querySelector('[role="list"]'),
+                              document.querySelector('div[aria-label*="list"]'),
+                            ].filter(Boolean);
+                            for (const el of candidates) {
+                              try { el.scrollTop = el.scrollHeight; } catch (e) {}
+                            }
+                        }"""
+                    )
+                    await asyncio.sleep(0.8)
             except Exception:
                 pass
 

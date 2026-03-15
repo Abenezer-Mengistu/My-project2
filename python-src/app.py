@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import re
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlparse, parse_qs, urlencode, urlunparse
 import httpx
 
 from fastapi import FastAPI, Request
@@ -28,6 +28,7 @@ from discovery.venue_parser import VenueParser
 from scraper.stubhub_parking import StubHubParkingScraper
 from scraper.ticketing_controller import TicketingController
 from scraper.playwright_cluster import PlaywrightClusterManager
+from scraper.stubhub_venue_updater import discover_and_update_venues
 
 # Register scrapers with their domain controller
 TicketingController.register_scraper(StubHubDiscoveryScraper)
@@ -1653,15 +1654,10 @@ async def ticketing_phase2(
                             "venue": row.get("venue"),
                             "event_name": row.get("event_name"),
                             "event_date": row.get("event_date"),
-                            "event_url": row.get("event_url"),
                             "parking_url": row.get("parking_url"),
                             "lot_name": p.get("lot_name"),
                             "price": p.get("price"),
                             "currency": p.get("currency"),
-                            "price_delta": metrics.get("price_delta"),
-                            "price_change_pct": metrics.get("price_change_pct"),
-                            "price_direction": metrics.get("price_direction"),
-                            "price_ratio_vs_baseline": metrics.get("price_ratio_vs_baseline"),
                             "availability": availability,
                             "listing_id": p.get("listing_id"),
                             "source": source,
@@ -1669,6 +1665,7 @@ async def ticketing_phase2(
                             "is_parking_inventory": is_parking_inventory,
                             "event_id": getattr(event_record, "_id", None),
                             "probe_title": probe.get("title"),
+                            "listing_details": p.get("listing_details"),
                         }
                     )
                 results.extend(_dedupe_phase2_rows(event_results))
@@ -2074,6 +2071,28 @@ async def ticketing_stubhub_complete(
     )
     outputs: dict = {"phase1": None, "phase2": None, "phase3": None}
 
+    # ── Phase 0 — Auto-update venues.xlsx from StubHub ──────────────────────
+    logger.info("[Phase0] Discovering new venues from StubHub...")
+    try:
+        cluster = await PlaywrightClusterManager.get_or_create()
+
+        async def _phase0_task(page):
+            return await discover_and_update_venues(
+                excel_path=excel_path,
+                page=page,
+                extra_urls=[
+                    "https://www.stubhub.com/ariana-grande-tickets/performer/151048496/",
+                    "https://www.stubhub.com/oakland-tickets/city/275/",
+                    "https://www.stubhub.com/los-angeles-tickets/city/7/"
+                ]
+            )
+
+        new_venues = await cluster.execute(_phase0_task)
+        logger.info(f"[Phase0] Done — {len(new_venues or [])} new venue(s) added to {excel_path}")
+    except Exception as exc:
+        logger.warning(f"[Phase0] Venue discovery failed (continuing): {exc}")
+
+    # ── Phase 1 onwards ──────────────────────────────────────────────────────
     current_phase1_json = None
     if run_phase1:
         phase1_result = await ticketing_phase1(

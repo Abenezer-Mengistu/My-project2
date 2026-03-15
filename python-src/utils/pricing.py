@@ -70,12 +70,33 @@ def extract_total_price(listing: dict) -> Decimal | None:
     return None
 
 
+CURRENCY_MAP = {
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "R": "ZAR",
+    "C$": "CAD",
+    "A$": "AUD",
+}
+
+
 def currency_from_listing(listing: dict) -> str:
     """
     Determine the currency code from a listing dict.
-
+    Checks 'currency' field, then tries to infer from 'price_incl_fees' or 'raw_text'.
     Falls back to USD if not specified.
     """
+    raw_currency = listing.get("currency")
+    if raw_currency and len(raw_currency) == 3:
+        return raw_currency.upper()
+
+    # Try inferring from price strings or details
+    price_str = listing.get("price_incl_fees") or listing.get("price") or ""
+    if isinstance(price_str, str):
+        for symbol, code in CURRENCY_MAP.items():
+            if symbol in price_str:
+                return code
+
     return "USD"
 
 

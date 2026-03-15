@@ -9,7 +9,7 @@ import asyncio
 import datetime
 import html
 import re
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlencode, urlunparse
 import pendulum
 
 from scraper.base.ticketing.ticketing_playwright_base import TicketingPlaywrightBase
@@ -129,6 +129,14 @@ class StubHubDiscoveryScraper(TicketingPlaywrightBase):
                 found.add(match)
         return sorted(found)
 
+    @staticmethod
+    def _with_page_param(url: str, page: int) -> str:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs["page"] = [str(page)]
+        new_query = urlencode({k: v[0] for k, v in qs.items()})
+        return urlunparse(parsed._replace(query=new_query))
+
     async def _safe_page_title(self) -> str:
         try:
             return (await self.page.title()).strip()
@@ -230,219 +238,244 @@ class StubHubDiscoveryScraper(TicketingPlaywrightBase):
         skip_persist = kwargs.get("skip_persist", False)
         venue_id = self._extract_venue_id(url)
         strict_venue_guard = bool(kwargs.get("strict_venue_guard", False))
-        # StubHub event pages can be slow; use longer timeout and "commit" to avoid domcontentloaded stall
-        for attempt in range(3):
-            try:
-                await self.page.goto(url, wait_until="commit", timeout=120000)
-                break
-            except Exception as exc:
-                if attempt == 2:
-                    if is_event_url:
-                        logger.warning(f"Event page load failed ({exc}).")
-                    raise
-                await asyncio.sleep(3.0)
-
-        # Strict guard: reject clear venue URL redirects/mismatches.
-        if strict_venue_guard and venue_id and not is_event_url:
-            current_url = self.page.url or ""
-            redirected_venue_id = self._extract_venue_id(current_url)
-            if redirected_venue_id and redirected_venue_id != venue_id:
-                raise ValueError(
-                    f"Venue context mismatch: expected venue/{venue_id}, got venue/{redirected_venue_id} ({current_url})"
-                )
-
-        await self.human_delay()
-        # Retry once if StubHub served a challenge/placeholder page.
-        title = (await self._safe_page_title()).lower()
-        if any(token in title for token in ["just a moment", "access denied", "attention required"]):
-            await asyncio.sleep(2)
-            await self.page.reload(wait_until="commit", timeout=120000)
-            await self.human_delay()
 
         if is_event_url:
+            # StubHub event pages can be slow; use longer timeout and "commit" to avoid domcontentloaded stall
+            for attempt in range(3):
+                try:
+                    await self.page.goto(url, wait_until="commit", timeout=120000)
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        logger.warning(f"Event page load failed ({exc}).")
+                        raise
+                    await asyncio.sleep(3.0)
+
+            await self.human_delay()
+            # Retry once if StubHub served a challenge/placeholder page.
+            title = (await self._safe_page_title()).lower()
+            if any(token in title for token in ["just a moment", "access denied", "attention required"]):
+                await asyncio.sleep(2)
+                await self.page.reload(wait_until="commit", timeout=120000)
+                await self.human_delay()
+
             single = await self._discover_single_event_from_event_page(venue, skip_persist=skip_persist)
             return [single] if single else []
 
         event_repo = None if skip_persist else get_event_repository()
         container_selector = ".eventGridListItem__container"
-        await self.wait_for_selector_safe(container_selector, timeout=10000)
-        await self.human_delay()
-        
-        event_elements = await self.page.query_selector_all(container_selector)
-        if not event_elements:
-            # Fallback for StubHub class-name changes: discover by event URL pattern.
-            event_elements = await self.page.query_selector_all("a[href*='/event/']")
-        if not event_elements:
-            # Last fallback: parse URLs from raw HTML (works when DOM hydration is partial).
-            page_html = await self.page.content()
-            raw_urls = self._extract_event_urls_from_html(page_html)
-            if not raw_urls:
-                logger.info(f"No events found for venue: {venue.name}")
-                return []
-            discovered_from_html = []
-            seen: set[str] = set()
-            for raw in raw_urls:
-                full_url = self._normalize_event_url(raw)
-                if not full_url or full_url in seen:
+        seen_urls: set[str] = set()
+        discovered_events: list[dict] = []
+        max_pages = int(kwargs.get("max_pages") or 20)
+
+        async def _extract_from_loaded_page() -> list[dict]:
+            await self.wait_for_selector_safe(container_selector, timeout=10000)
+            await self.human_delay()
+
+            event_elements = await self.page.query_selector_all(container_selector)
+            if not event_elements:
+                # Fallback for StubHub class-name changes: discover by event URL pattern.
+                event_elements = await self.page.query_selector_all("a[href*='/event/']")
+            if not event_elements:
+                # Last fallback: parse URLs from raw HTML (works when DOM hydration is partial).
+                page_html = await self.page.content()
+                raw_urls = self._extract_event_urls_from_html(page_html)
+                if not raw_urls:
+                    return []
+                discovered_from_html = []
+                for raw in raw_urls:
+                    full_url = self._normalize_event_url(raw)
+                    if not full_url:
+                        continue
+                    if "parking-passes-only" not in full_url.lower():
+                        continue
+                    id_match = re.search(r"/event/(\d+)", full_url)
+                    dedup_key = id_match.group(1) if id_match else full_url
+                    if dedup_key in seen_urls:
+                        continue
+                    seen_urls.add(dedup_key)
+                    slug_match = re.search(r"stubhub\.com/([^/?]+)-tickets-[^/]+/event/\d+", full_url)
+                    if not slug_match:
+                        continue
+                    slug = slug_match.group(1).replace("-", " ").strip()
+                    name = " ".join(word.capitalize() for word in slug.split())
+                    event_date = self._extract_date_from_event_url(full_url) or datetime.date.today()
+                    event_data = {
+                        "venue": venue,
+                        "name": name,
+                        "date": event_date,
+                        "event_url": full_url,
+                    }
+                    if id_match:
+                        event_data["external_id"] = id_match.group(1)
+                    if event_repo is not None:
+                        await event_repo.upsert_event(event_data)
+                    discovered_from_html.append(
+                        {
+                            "venue": venue.name,
+                            "event_name": name,
+                            "event_date": event_date.isoformat(),
+                            "event_url": full_url,
+                            "parking_url": full_url,
+                        }
+                    )
+                return discovered_from_html
+
+            page_events = []
+            for el in event_elements:
+                # Explicitly wait for nested elements if needed, or query them directly
+                name = None
+                for sel in [".eventGridListItemContent__title", "h3"]:
+                    try:
+                        name = await el.eval_on_selector(sel, "s => s.innerText?.trim()") or None
+                        if name:
+                            break
+                    except Exception:
+                        pass
+                if name is None:
+                    name = await el.get_attribute("title")
+
+                raw_href = await el.get_attribute("href")
+                event_url = self._normalize_event_url(raw_href)
+                if not event_url:
                     continue
-                if "parking-passes-only" not in full_url.lower():
+                # Keep most links, but reject clearly mismatched venue backlinks.
+                if venue_id and raw_href:
+                    back_venue_id = self._extract_venue_id_from_backurl(html.unescape(raw_href))
+                    if back_venue_id and back_venue_id != venue_id:
+                        continue
+
+                # Extract date text
+                date_text = None
+                for sel in [".eventGridListItemContent__date", "time"]:
+                    try:
+                        date_text = await el.eval_on_selector(sel, "t => t.innerText?.trim()") or None
+                        if date_text:
+                            break
+                    except Exception:
+                        pass
+
+                # Extract external_id
+                full_url = event_url
+                if not full_url:
                     continue
+
                 id_match = re.search(r"/event/(\d+)", full_url)
-                dedup_key = id_match.group(1) if id_match else full_url
-                if dedup_key in seen:
+                external_id = id_match.group(1) if id_match else None
+                if full_url in seen_urls:
                     continue
-                seen.add(dedup_key)
-                slug_match = re.search(r"stubhub\.com/([^/?]+)-tickets-[^/]+/event/\d+", full_url)
-                if not slug_match:
+                seen_urls.add(full_url)
+
+                # Fallback name from slug when visible card title selector is missing.
+                card_text = (await el.inner_text()).lower()
+                is_parking_event = "parking-passes-only" in full_url.lower() or "parking passes only" in card_text
+                if not is_parking_event:
                     continue
-                slug = slug_match.group(1).replace("-", " ").strip()
-                name = " ".join(word.capitalize() for word in slug.split())
-                event_date = self._extract_date_from_event_url(full_url) or datetime.date.today()
+
+                if not name:
+                    slug_match = re.search(r"stubhub\.com/([^/?]+)-tickets-[^/]+/event/\d+", full_url)
+                    if slug_match:
+                        slug = slug_match.group(1).replace("-", " ").strip()
+                        name = " ".join(word.capitalize() for word in slug.split())
+
+                if is_parking_event and name and "parking" not in name.lower():
+                    name = f"Parking: {name}"
+
+                if not name:
+                    continue
+
+                # Parse date: prefer canonical date from URL when available.
+                url_date = self._extract_date_from_event_url(full_url)
+                event_date = url_date or datetime.date.today()
+                if date_text and url_date is None:
+                    try:
+                        # Try common StubHub date formats from event cards.
+                        for fmt in ["%b %d %a", "%b %d", "%a, %b %d", "%m/%d/%Y"]:
+                            try:
+                                parsed = pendulum.from_format(date_text, fmt)
+                                now = pendulum.now()
+                                # If input omits year, map to this/next year.
+                                if fmt in {"%b %d %a", "%b %d", "%a, %b %d"}:
+                                    parsed = parsed.set(year=now.year)
+                                    if parsed < now.subtract(days=30):
+                                        parsed = parsed.add(years=1)
+                                event_date = parsed.date()
+                                break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
                 event_data = {
                     "venue": venue,
                     "name": name,
                     "date": event_date,
                     "event_url": full_url,
                 }
-                if id_match:
-                    event_data["external_id"] = id_match.group(1)
+                if external_id:
+                    event_data["external_id"] = external_id
+
                 if event_repo is not None:
                     await event_repo.upsert_event(event_data)
-                discovered_from_html.append(
-                    {
-                        "venue": venue.name,
-                        "event_name": name,
-                        "event_date": event_date.isoformat(),
-                        "event_url": full_url,
-                        "parking_url": full_url,
-                    }
-                )
-            if discovered_from_html:
-                return discovered_from_html
-            logger.info(f"No events found for venue: {venue.name}")
-            return []
 
-        discovered_events = []
-        seen_urls: set[str] = set()
-
-        for el in event_elements:
-            # Explicitly wait for nested elements if needed, or query them directly
-            name = None
-            for sel in [".eventGridListItemContent__title", "h3"]:
+                # Extract venue information from the card (especially important for performer pages)
+                inner_venue_name = None
+                inner_venue_url = None
                 try:
-                    name = await el.eval_on_selector(sel, "s => s.innerText?.trim()") or None
-                    if name:
-                        break
-                except Exception:
-                    pass
-            if name is None:
-                name = await el.get_attribute("title")
-
-            raw_href = await el.get_attribute("href")
-            event_url = self._normalize_event_url(raw_href)
-            if not event_url:
-                continue
-            # Keep most links, but reject clearly mismatched venue backlinks.
-            if venue_id and raw_href:
-                back_venue_id = self._extract_venue_id_from_backurl(html.unescape(raw_href))
-                if back_venue_id and back_venue_id != venue_id:
-                    continue
-
-            # Extract date text
-            date_text = None
-            for sel in [".eventGridListItemContent__date", "time"]:
-                try:
-                    date_text = await el.eval_on_selector(sel, "t => t.innerText?.trim()") or None
-                    if date_text:
-                        break
+                    # StubHub often has a link to the venue inside the event information
+                    v_link = await el.query_selector("a[href*='/venue/']")
+                    if v_link:
+                        raw_v_href = await v_link.get_attribute("href")
+                        inner_venue_url = self._normalize_venue_url(raw_v_href)
+                        inner_venue_name = (await v_link.inner_text()).strip()
                 except Exception:
                     pass
 
-            # Extract external_id
-            full_url = event_url
-            if not full_url:
-                continue
-                
-            id_match = re.search(r"/event/(\d+)", full_url)
-            external_id = id_match.group(1) if id_match else None
-            if full_url in seen_urls:
-                continue
-            seen_urls.add(full_url)
+                # Formatted output for API response
+                page_events.append({
+                    "venue": inner_venue_name or venue.name,
+                    "venue_url": inner_venue_url,
+                    "event_name": name,
+                    "event_date": event_date.isoformat(),
+                    "event_url": full_url,
+                    "parking_url": full_url,
+                })
 
-            # Fallback name from slug when visible card title selector is missing.
-            card_text = (await el.inner_text()).lower()
-            is_parking_event = "parking-passes-only" in full_url.lower() or "parking passes only" in card_text
-            if not is_parking_event:
-                continue
-            
-            if not name:
-                slug_match = re.search(r"stubhub\.com/([^/?]+)-tickets-[^/]+/event/\d+", full_url)
-                if slug_match:
-                    slug = slug_match.group(1).replace("-", " ").strip()
-                    name = " ".join(word.capitalize() for word in slug.split())
-            
-            if is_parking_event and name and "parking" not in name.lower():
-                name = f"Parking: {name}"
+            return page_events
 
-            if not name:
-                continue
-
-            # Parse date: prefer canonical date from URL when available.
-            url_date = self._extract_date_from_event_url(full_url)
-            event_date = url_date or datetime.date.today()
-            if date_text and url_date is None:
+        for page_index in range(1, max_pages + 1):
+            page_url = url if page_index == 1 else self._with_page_param(url, page_index)
+            # StubHub event pages can be slow; use longer timeout and "commit" to avoid domcontentloaded stall
+            for attempt in range(3):
                 try:
-                    # Try common StubHub date formats from event cards.
-                    for fmt in ["%b %d %a", "%b %d", "%a, %b %d", "%m/%d/%Y"]:
-                        try:
-                            parsed = pendulum.from_format(date_text, fmt)
-                            now = pendulum.now()
-                            # If input omits year, map to this/next year.
-                            if fmt in {"%b %d %a", "%b %d", "%a, %b %d"}:
-                                parsed = parsed.set(year=now.year)
-                                if parsed < now.subtract(days=30):
-                                    parsed = parsed.add(years=1)
-                            event_date = parsed.date()
-                            break
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                    await self.page.goto(page_url, wait_until="commit", timeout=120000)
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(3.0)
 
-            event_data = {
-                "venue": venue,
-                "name": name,
-                "date": event_date,
-                "event_url": full_url,
-            }
-            if external_id:
-                event_data["external_id"] = external_id
+            # Strict guard: reject clear venue URL redirects/mismatches.
+            if strict_venue_guard and venue_id:
+                current_url = self.page.url or ""
+                redirected_venue_id = self._extract_venue_id(current_url)
+                if redirected_venue_id and redirected_venue_id != venue_id:
+                    raise ValueError(
+                        f"Venue context mismatch: expected venue/{venue_id}, got venue/{redirected_venue_id} ({current_url})"
+                    )
 
-            if event_repo is not None:
-                await event_repo.upsert_event(event_data)
-            
-            # Extract venue information from the card (especially important for performer pages)
-            inner_venue_name = None
-            inner_venue_url = None
-            try:
-                # StubHub often has a link to the venue inside the event information
-                v_link = await el.query_selector("a[href*='/venue/']")
-                if v_link:
-                    raw_v_href = await v_link.get_attribute("href")
-                    inner_venue_url = self._normalize_venue_url(raw_v_href)
-                    inner_venue_name = (await v_link.inner_text()).strip()
-            except Exception:
-                pass
+            await self.human_delay()
+            # Retry once if StubHub served a challenge/placeholder page.
+            title = (await self._safe_page_title()).lower()
+            if any(token in title for token in ["just a moment", "access denied", "attention required"]):
+                await asyncio.sleep(2)
+                await self.page.reload(wait_until="commit", timeout=120000)
+                await self.human_delay()
 
-            # Formatted output for API response
-            discovered_events.append({
-                "venue": inner_venue_name or venue.name,
-                "venue_url": inner_venue_url,
-                "event_name": name,
-                "event_date": event_date.isoformat(),
-                "event_url": full_url,
-                "parking_url": full_url,
-            })
+            page_events = await _extract_from_loaded_page()
+            if not page_events:
+                break
+            discovered_events.extend(page_events)
 
         return discovered_events
 
