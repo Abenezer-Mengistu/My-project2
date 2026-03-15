@@ -9,6 +9,8 @@ import asyncio
 import html
 import re
 import json
+import shutil
+import time
 
 from scraper.base.ticketing.ticketing_playwright_base import TicketingPlaywrightBase
 from database.repositories.ticketing.parking_passes import get_parking_pass_repository
@@ -21,6 +23,7 @@ from loguru import logger
 
 class StubHubParkingScraper(TicketingPlaywrightBase):
     handler: str = "stubhub-parking"
+    _debug_dir: Path | None = None
 
     @staticmethod
     def _currency_from_text(price_text: str) -> str:
@@ -343,7 +346,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         logger.info(f"[Scraper] Listings ready status: {is_ready}")
         
         # Capture screenshot for debugging
-        debug_ss_path = STORAGE_DIR / f"debug_phase2_{int(asyncio.get_event_loop().time())}.png"
+        debug_base = self._debug_dir or STORAGE_DIR
+        debug_ss_path = debug_base / f"debug_phase2_{int(asyncio.get_event_loop().time())}.png"
         try:
             await self.page.screenshot(path=str(debug_ss_path))
             logger.info(f"[Scraper] Debug screenshot saved to {debug_ss_path}")
@@ -728,6 +732,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         return self._extract_passes_from_text(page_html, source="embedded_html")
 
     async def scrape_parking_details(self, event) -> list[dict]:
+        # Create a fresh debug folder per run; delete after scraping is done.
+        self._debug_dir = STORAGE_DIR / f"debug_phase2_{int(time.time())}"
+        try:
+            self._debug_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self._debug_dir = STORAGE_DIR
         async def _attempt(url: str, label: str) -> tuple[list[dict], dict]:
             captured_payloads: list[str] = []
             captured_urls: list[str] = []
@@ -867,13 +877,21 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         else:
             primary_url += "?quantity=0"
 
-        passes, probe = await _attempt(primary_url, "parking_url")
-        if passes:
-            self._last_probe = probe
-            return passes
+        try:
+            passes, probe = await _attempt(primary_url, "parking_url")
+            if passes:
+                self._last_probe = probe
+                return passes
 
-        self._last_probe = probe
-        return []
+            self._last_probe = probe
+            return []
+        finally:
+            if self._debug_dir and self._debug_dir != STORAGE_DIR:
+                try:
+                    shutil.rmtree(self._debug_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            self._debug_dir = None
 
     async def scrape_parking(self, event) -> int:
         passes = await self.scrape_parking_details(event)
