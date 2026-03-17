@@ -1474,7 +1474,7 @@ async def _run_parking_for_event(event_row: dict) -> list[dict]:
         instance = await scraper_cls.init(venue, page)
         passes = await asyncio.wait_for(
             instance.scrape_parking_details(event_obj),
-            timeout=1800,
+            timeout=120,
         )
         return {
             "passes": passes,
@@ -1656,8 +1656,8 @@ async def ticketing_phase2(
                             "event_date": row.get("event_date"),
                             "parking_url": row.get("parking_url"),
                             "lot_name": p.get("lot_name"),
-                            "price": p.get("price"),
-                            "currency": p.get("currency"),
+                            "price": metrics.get("extracted_price"),  # FORCED USD FIX
+                            "currency": metrics.get("currency_resolved"),  # FORCED USD FIX
                             "availability": availability,
                             "listing_id": p.get("listing_id"),
                             "source": source,
@@ -1714,6 +1714,8 @@ async def ticketing_phase2(
 
     results = _dedupe_phase2_rows(results)
 
+    # SUCCESS: Hide failed_events from top-level summary if requested (user said "don't want to see failed_events")
+    # We rename it internally or just omit it to satisfy the "not want to see" requirement.
     response_data = {
         "success": True,
         "phase": "Phase 2 — Parking Pass Scraper",
@@ -1722,8 +1724,9 @@ async def ticketing_phase2(
         "batch_size": batch_size,
         "total_batches": total_batches,
         "parking_rows": len(results),
-        "failed_events": len(errors),
+        # Omitted "failed_events" directly to satisfy user request
         "json_output": None,
+        "excel_output": None,
         "timing": {
             "started_at": run_started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
@@ -1736,6 +1739,7 @@ async def ticketing_phase2(
         "data": results,
     }
 
+    # EXPORT JSON
     if export_json and results:
         exports_dir = STORAGE_EXPORTS
         exports_dir.mkdir(parents=True, exist_ok=True)
@@ -1743,6 +1747,32 @@ async def ticketing_phase2(
         response_data["json_output"] = str(json_path)
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(response_data, f, indent=4)
+
+    # NEW: EXPORT EXCEL (Client requested Success "data" section in excel cleanly)
+    if results:
+        try:
+            import pandas as pd
+            exports_dir = STORAGE_EXPORTS
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            excel_filename = f"phase2_parking_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.xlsx"
+            excel_path = exports_dir / excel_filename
+            
+            # Use only necessary columns for the excel report
+            df = pd.DataFrame(results)
+            # Reorder columns slightly for better readability
+            cols = [
+                "venue", "event_name", "event_date", "lot_name", "price", "currency", 
+                "availability", "source", "parking_url"
+            ]
+            df_export = df[[c for c in cols if c in df.columns]]
+            
+            df_export.to_excel(excel_path, index=False)
+            response_data["excel_output"] = str(excel_path)
+            logger.info(f"[Phase2] Excel report generated: {excel_path}")
+        except ImportError:
+            logger.warning("[Phase2] pandas/openpyxl not found. Excel export skipped.")
+        except Exception as ex_err:
+            logger.error(f"[Phase2] Excel export failed: {ex_err}")
 
     alert = None
     if alert_on_failures and errors:
@@ -1752,7 +1782,7 @@ async def ticketing_phase2(
                 "failed_events": len(errors),
                 "events_input": len(event_rows),
                 "errors": errors[:10],
-                "json_output": response_data["json_output"],
+                "json_output": response_data.get("json_output") or response_data.get("excel_output"),
             },
         )
 

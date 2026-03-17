@@ -1,0 +1,1 @@
+{"success":false,"error":"Phase2 requires phase1_json or parking_urls. For parking-only: use parking_urls=<comma-separated URLs>.","phase1_summary":{"processed_items":0,"failed_venues":0,"errors":[]},"hint":"Provide parking_urls for parking-only extraction, or run phase1 / provide phase1_json."}
