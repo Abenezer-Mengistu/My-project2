@@ -27,6 +27,18 @@ cd python-src
 
 Server runs at **http://127.0.0.1:5556** (default port 5556).
 
+### 2.5 Use the simple web UI (non-technical)
+
+Open this in a browser:
+
+- `http://127.0.0.1:5556/ui/parking-links`
+
+From the UI you can:
+
+- **Direct mode**: paste venue/performer URL(s) and click **Generate**
+- **Auto mode**: provide a seed URL and click **Generate** (can fallback to `venues.xlsx` on blocked pages)
+- **Download latest JSON**: downloads the most recent export from `python-src/storage/search_results/`
+
 ### 3. Run the full pipeline (all 3 phases)
 
 Use **file** mode (reads `python-src/venues.xlsx`) — no database required:
@@ -66,6 +78,8 @@ curl -s 'http://127.0.0.1:5556/ticketing/parking-only?parking_urls=https://www.s
 
 This is a separate tool-style endpoint for teams who just need **event URLs and parking URLs** (Phase 1 output shape),
 without running Phase 2 parking extraction.
+
+- **Simple UI**: `http://127.0.0.1:5556/ui/parking-links`
 
 - **Direct input (venue / performer URL):**
 
