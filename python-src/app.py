@@ -18,7 +18,7 @@ from urllib.parse import unquote, urlsplit, urlparse, parse_qs, urlencode, urlun
 import httpx
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 
 # Scraper registration — ensuring modular components are loaded
 from discovery.stubhub_discovery import StubHubDiscoveryScraper
@@ -57,6 +57,8 @@ BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 STORAGE_EXPORTS = STORAGE_DIR / "exports"
 STORAGE_MONITORING = STORAGE_DIR / "monitoring"
+STORAGE_SEARCH_RESULTS = STORAGE_DIR / "search_results"
+UI_DIR = BASE_DIR / "ui"
 
 
 def _storage_output_path(excel_path: str) -> Path:
@@ -228,6 +230,381 @@ async def ticketing_live(
         }
     except Exception as exc:
         return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+
+def _parse_comma_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _safe_result_filename(name: str | None) -> str | None:
+    if not name:
+        return None
+    n = Path(name).name
+    if not n.endswith(".json"):
+        return None
+    return n
+
+
+def _latest_search_result() -> Path | None:
+    if not STORAGE_SEARCH_RESULTS.exists():
+        return None
+    candidates = sorted(STORAGE_SEARCH_RESULTS.glob("parking_links_*.json"), reverse=True)
+    return candidates[0] if candidates else None
+
+
+@app.get("/ui/parking-links", response_class=HTMLResponse)
+async def ui_parking_links():
+    page = UI_DIR / "parking_links.html"
+    if not page.exists():
+        return HTMLResponse(
+            "<h2>UI not found</h2><p>Missing file: python-src/ui/parking_links.html</p>",
+            status_code=500,
+        )
+    return HTMLResponse(page.read_text(encoding="utf-8"))
+
+
+@app.post("/ui/parking-links/run")
+async def ui_parking_links_run(request: Request):
+    """
+    UI execution endpoint. Accepts JSON or form-encoded body.
+    Calls ticketing_parking_links(...) directly and returns JSON.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: dict = {}
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    mode = (payload.get("mode") or "direct").strip().lower()
+
+    def _bool(v, default=False):
+        if v is None:
+            return default
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    def _int(v, default):
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+    common = {
+        "strict_event_location_match": _bool(payload.get("strict_event_location_match"), False),
+        "strict_venue_guard": _bool(payload.get("strict_venue_guard"), True),
+        "export_json": _bool(payload.get("export_json"), True),
+    }
+
+    if mode == "auto":
+        result = await ticketing_parking_links(
+            auto_find_venues=True,
+            seed_url=(payload.get("seed_url") or "").strip() or None,
+            max_venues=_int(payload.get("max_venues"), 25),
+            max_pages=_int(payload.get("max_pages"), 0),
+            full=_bool(payload.get("full"), False),
+            venue_discovery_timeout_seconds=_int(payload.get("venue_discovery_timeout_seconds"), 90),
+            fallback_to_excel=_bool(payload.get("fallback_to_excel"), True),
+            excel_path=(payload.get("excel_path") or "venues.xlsx").strip(),
+            **common,
+        )
+    else:
+        # direct
+        raw_urls = (payload.get("stubhub_urls") or "").strip()
+        stubhub_urls = ",".join([u for u in raw_urls.replace("\n", ",").split(",") if u.strip()])
+        result = await ticketing_parking_links(
+            stubhub_urls=stubhub_urls,
+            venue_name=(payload.get("venue_name") or "Ad-hoc Venue").strip() or "Ad-hoc Venue",
+            **common,
+        )
+
+    return result
+
+
+@app.get("/ui/parking-links/download")
+async def ui_parking_links_download(name: str | None = None):
+    """
+    Download exported JSON from python-src/storage/search_results.
+    If name is omitted, serves the latest parking_links_*.json.
+    """
+    STORAGE_SEARCH_RESULTS.mkdir(parents=True, exist_ok=True)
+    filename = _safe_result_filename(name)
+    path = (STORAGE_SEARCH_RESULTS / filename) if filename else (_latest_search_result() or None)
+    if not path or not path.exists():
+        return JSONResponse({"success": False, "error": "No exported result found."}, status_code=404)
+    return FileResponse(
+        path=str(path),
+        media_type="application/json",
+        filename=path.name,
+    )
+
+
+@app.get("/ticketing/parking-links")
+async def ticketing_parking_links(
+    stubhub_urls: str | None = None,
+    venue_name: str = "Ad-hoc Venue",
+    handler: str = "stubhub-discovery",
+    auto_find_venues: bool = False,
+    seed_url: str | None = None,
+    max_venues: int = 50,
+    max_pages: int = 0,
+    full: bool = False,
+    venue_discovery_timeout_seconds: int = 90,
+    fallback_to_excel: bool = True,
+    excel_path: str = "venues.xlsx",
+    strict_venue_guard: bool = True,
+    strict_event_location_match: bool = True,
+    export_json: bool = True,
+):
+    """
+    Generate event + parking links only (NO parking spot extraction).
+
+    Input options:
+    - Direct venue URL(s): stubhub_urls=<comma-separated StubHub venue/performer URLs>
+    - Auto venue finding: auto_find_venues=true&seed_url=<StubHub page> (discovers venue links, then runs discovery per venue)
+      - full=true: always use browser-assisted extraction (slower, more reliable)
+      - max_pages>0: request more feed pages to discover more venues (slower)
+      - venue_discovery_timeout_seconds: hard timeout for venue discovery (tool safety)
+      - fallback_to_excel=true: if StubHub blocks seed scraping, use local venues.xlsx as fallback
+    """
+    resolved_venues: list[dict] = []
+    venue_discovery_attempts: list[dict] | None = None
+    venue_discovery_timed_out = False
+
+    if auto_find_venues:
+        if not seed_url:
+            return JSONResponse(
+                {"success": False, "error": "seed_url is required when auto_find_venues=true"},
+                status_code=400,
+            )
+        if max_venues < 1:
+            return JSONResponse({"success": False, "error": "max_venues must be >= 1"}, status_code=400)
+        if venue_discovery_timeout_seconds < 5:
+            return JSONResponse(
+                {"success": False, "error": "venue_discovery_timeout_seconds must be >= 5"},
+                status_code=400,
+            )
+
+        # Discover venue pages from seed_url (HTTP + feeds, with optional browser assistance).
+        #
+        # Laptop-friendly defaults:
+        # - If caller didn't specify max_pages, keep it small so this endpoint returns quickly.
+        # - Only use Playwright for venue discovery when full=true (otherwise we can hang on bot/JS pages).
+        effective_max_pages = max(0, int(max_pages or 0)) or 3
+        use_playwright_if_empty = bool(full)
+        try:
+            discovered_rows, venue_discovery_attempts = await asyncio.wait_for(
+                _scrape_venues_from_stubhub(
+                    start_url=seed_url,
+                    use_playwright_if_empty=use_playwright_if_empty,
+                    use_playwright_always=bool(full),
+                    max_pages=effective_max_pages,
+                ),
+                timeout=float(venue_discovery_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            venue_discovery_timed_out = True
+            discovered_rows = []
+        except Exception as exc:
+            return JSONResponse({"success": False, "error": str(exc)}, status_code=500)
+
+        resolved_venues = [
+            {
+                "name": r.get("name") or "Discovered Venue",
+                "stubhub_url": r.get("stubhub_url"),
+                "handler": r.get("handler") or handler,
+                "location": r.get("location"),
+            }
+            for r in discovered_rows
+            if r.get("stubhub_url")
+        ][:max_venues]
+
+        if not resolved_venues:
+            blocked_like = False
+            if venue_discovery_attempts:
+                for a in venue_discovery_attempts:
+                    sc = a.get("status_code")
+                    ct = str(a.get("content_type") or "").lower()
+                    if sc in {202, 403, 429} or ("text/html" in ct and sc not in {200}):
+                        blocked_like = True
+                        break
+
+            # Laptop-friendly fallback: use local venues.xlsx if auto-find is blocked.
+            if fallback_to_excel:
+                try:
+                    input_path = Path(excel_path)
+                    if not input_path.is_absolute():
+                        candidates = [
+                            STORAGE_EXPORTS / input_path.name,
+                            BASE_DIR / input_path,
+                            Path.cwd() / input_path,
+                            BASE_DIR.parent / input_path,
+                        ]
+                        input_path = next((p for p in candidates if p.exists()), input_path)
+                    if input_path.exists():
+                        fallback_rows = VenueParser.from_excel(str(input_path))[:max_venues]
+                        resolved_venues = [
+                            {
+                                "name": r.get("name") or "Excel Venue",
+                                "stubhub_url": r.get("stubhub_url"),
+                                "handler": r.get("handler") or handler,
+                                "location": r.get("location"),
+                            }
+                            for r in fallback_rows
+                            if r.get("stubhub_url")
+                        ]
+                except Exception:
+                    resolved_venues = []
+
+            if resolved_venues:
+                # Continue into discovery phase with fallback venues.
+                pass
+            else:
+                return {
+                    "success": True,
+                    "tool": "parking-links",
+                    "mode": "auto_find_venues",
+                    "seed_url": seed_url,
+                    "venues_resolved": 0,
+                    "events_generated": 0,
+                    "venue_discovery": {
+                        "full": bool(full),
+                        "max_pages": effective_max_pages,
+                        "attempts": venue_discovery_attempts or [],
+                        "timed_out": bool(venue_discovery_timed_out),
+                        "timeout_seconds": venue_discovery_timeout_seconds if venue_discovery_timed_out else None,
+                    },
+                    "data": [],
+                    "message": (
+                        "Venue discovery timed out and Excel fallback is disabled."
+                        if venue_discovery_timed_out and not fallback_to_excel
+                        else
+                        "No venues discovered from seed_url. StubHub may be returning an anti-bot/challenge response."
+                        if blocked_like
+                        else "No venues discovered from seed_url."
+                    ),
+                }
+    else:
+        urls = _parse_comma_list(stubhub_urls)
+        if not urls:
+            return JSONResponse(
+                {"success": False, "error": "stubhub_urls is required (comma-separated StubHub venue/performer URLs)"},
+                status_code=400,
+            )
+        for u in urls:
+            resolved_venues.append(
+                {
+                    "name": venue_name,
+                    "stubhub_url": u,
+                    "handler": handler,
+                    "location": None,
+                }
+            )
+
+    all_events: list[dict] = []
+    errors: list[dict] = []
+    for row in resolved_venues:
+        v_name = row.get("name") or venue_name
+        v_url = row.get("stubhub_url") or ""
+        v_handler = row.get("handler") or handler
+        v_location = row.get("location")
+        venue = SimpleNamespace(
+            name=v_name,
+            stubhub_url=v_url,
+            handler=v_handler,
+            proxy=None,
+            user_agent=None,
+        )
+        try:
+            discovered_events = await _run_discovery_for_venue(
+                venue=venue,
+                handler=v_handler,
+                dry_run=False,
+                persist=False,
+                strict_venue_guard=strict_venue_guard,
+            )
+
+            # If it's a performer page, optionally do the parking-filtered discovery too (matches Phase1 behavior).
+            is_performer_url = "/performer/" in v_url
+            if is_performer_url and not ("gridFilterType=" in v_url):
+                sep = "&" if "?" in v_url else "?"
+                parking_venue = SimpleNamespace(
+                    name=v_name,
+                    stubhub_url=f"{v_url.rstrip('/')}/{sep}gridFilterType=1",
+                    handler=v_handler,
+                    proxy=None,
+                    user_agent=None,
+                )
+                try:
+                    parking_discovered = await _run_discovery_for_venue(
+                        venue=parking_venue,
+                        handler=v_handler,
+                        dry_run=False,
+                        persist=False,
+                        strict_venue_guard=strict_venue_guard,
+                    )
+                    discovered_events.extend(parking_discovered)
+                except Exception as p_exc:
+                    logger.warning(f"Secondary parking discovery failed for {v_name}: {p_exc}")
+
+            for ev in discovered_events:
+                if strict_event_location_match and _is_event_location_mismatch(v_location, ev.get("event_url")):
+                    continue
+                all_events.append(
+                    {
+                        "venue": ev.get("venue") or v_name,
+                        "event_name": ev.get("event_name") or ev.get("name"),
+                        "event_date": ev.get("event_date") or ev.get("date"),
+                        "event_url": ev.get("event_url"),
+                        "parking_url": ev.get("parking_url"),
+                    }
+                )
+        except Exception as exc:
+            errors.append({"venue": v_name, "stubhub_url": v_url, "error": str(exc)})
+
+    all_events = _dedupe_phase1_events(all_events)
+
+    response_data = {
+        "success": True,
+        "tool": "parking-links",
+        "mode": "auto_find_venues" if auto_find_venues else "direct_input",
+        "seed_url": seed_url if auto_find_venues else None,
+        "venues_input": len(_parse_comma_list(stubhub_urls)) if not auto_find_venues else None,
+        "venues_resolved": len(resolved_venues),
+        "events_generated": len(all_events),
+        "strict_venue_guard": strict_venue_guard,
+        "strict_event_location_match": strict_event_location_match,
+        "venue_discovery": (
+            {
+                "full": bool(full),
+                "max_pages": effective_max_pages,
+                "attempts": venue_discovery_attempts or [],
+            }
+            if auto_find_venues
+            else None
+        ),
+        "errors": errors,
+        "json_output": None,
+        "data": all_events,
+    }
+
+    if export_json and all_events:
+        STORAGE_SEARCH_RESULTS.mkdir(parents=True, exist_ok=True)
+        json_path = STORAGE_SEARCH_RESULTS / f"parking_links_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+        response_data["json_output"] = str(json_path)
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(response_data, f, indent=4)
+
+    return response_data
 
 
 async def _run_discovery_for_venue(
@@ -606,7 +983,12 @@ async def _scrape_venues_from_stubhub(
             "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        # Tool safety: when max_pages is provided and small, keep timeouts tight.
+        tool_mode = bool(max_pages and int(max_pages) > 0)
+        page_cap_for_tool = min(int(max_pages), 100) if tool_mode else 0
+        http_timeout = 10 if tool_mode and page_cap_for_tool <= 5 else 20
+
+        async with httpx.AsyncClient(timeout=http_timeout, follow_redirects=True) as client:
             resp = await client.get(start_url, headers=default_headers)
             extracted = _extract_stubhub_venues_from_text(resp.text)
             extracted.extend(_extract_stubhub_venues_from_event_snippets(resp.text))
@@ -620,24 +1002,44 @@ async def _scrape_venues_from_stubhub(
             )
             if "stubhub.com" in base_url:
                 max_rows = 500
-                # Exhaustive: max_pages > 0 → request up to that many pages per feed to get thousands of venues
-                num_pages_home = max(25, max_pages) if max_pages > 0 else 25
-                num_pages_explore = max(20, max_pages) if max_pages > 0 else 20
-                extra_cats = (4, 5, 6, 7, 8, 9, 10, 11, 12) if max_pages > 0 else (4, 5, 6)
-                extra_cat_pages = min(20, max(8, max_pages)) if max_pages > 0 else 8
+                # max_pages:
+                # - 0 => use safe defaults (fast-ish, decent coverage)
+                # - >0 => honor caller limit (important for "tool" endpoints that must return quickly)
+                if max_pages > 0:
+                    page_cap = min(int(max_pages), 100)
+                    num_pages_home = page_cap
+                    num_pages_explore = page_cap
+                    extra_cat_pages = min(20, page_cap)
+                    # Only expand categories for larger runs; keep small runs lightweight.
+                    extra_cats = (4, 5, 6) if page_cap <= 10 else (4, 5, 6, 7, 8, 9, 10, 11, 12)
+                else:
+                    num_pages_home = 25
+                    num_pages_explore = 20
+                    extra_cats = (4, 5, 6)
+                    extra_cat_pages = 8
 
-                method_urls = [
-                    f"{base_url}/?method=DontMissEvents&categoryId=0&maxRows={max_rows}&page=0",
-                    f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=3&page=0",
-                    f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page=0",
-                    f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page=0",
-                    f"{base_url}/?method=RecommendedForYouCategories&topLevelCategoryId=0&includeDateRanges=true",
-                ]
+                # Lightweight mode for tools: keep URL fanout small when page_cap is small.
+                if max_pages > 0 and page_cap <= 5:
+                    method_urls = [
+                        f"{base_url}/?method=DontMissEvents&categoryId=0&maxRows={max_rows}&page=0",
+                        f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=3&page=0",
+                    ]
+                    extra_cats = ()
+                    extra_cat_pages = 0
+                else:
+                    method_urls = [
+                        f"{base_url}/?method=DontMissEvents&categoryId=0&maxRows={max_rows}&page=0",
+                        f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=3&page=0",
+                        f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page=0",
+                        f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page=0",
+                        f"{base_url}/?method=RecommendedForYouCategories&topLevelCategoryId=0&includeDateRanges=true",
+                    ]
                 for page in range(1, num_pages_home):
                     method_urls.append(f"{base_url}/?method=DontMissEvents&categoryId=0&maxRows={max_rows}&page={page}")
                     method_urls.append(f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=3&page={page}")
-                    method_urls.append(f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page={page}")
-                    method_urls.append(f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page={page}")
+                    if not (max_pages > 0 and page_cap <= 5):
+                        method_urls.append(f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page={page}")
+                        method_urls.append(f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page={page}")
                 for cat_id in extra_cats:
                     for page in range(0, extra_cat_pages):
                         method_urls.append(f"{base_url}/?method=MostPopularCategories&maxRows={max_rows}&categoryId={cat_id}&page={page}")
@@ -646,18 +1048,26 @@ async def _scrape_venues_from_stubhub(
                         [
                             f"{base_url}/explore?method=DontMissEvents&categoryId=0&maxRows={max_rows}&page=0",
                             f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=3&page=0",
-                            f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page=0",
-                            f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page=0",
+                            *(
+                                [
+                                    f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page=0",
+                                    f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page=0",
+                                ]
+                                if not (max_pages > 0 and page_cap <= 5)
+                                else []
+                            ),
                         ]
                     )
                     for page in range(1, num_pages_explore):
                         method_urls.append(f"{base_url}/explore?method=DontMissEvents&categoryId=0&maxRows={max_rows}&page={page}")
                         method_urls.append(f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=3&page={page}")
-                        method_urls.append(f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page={page}")
-                        method_urls.append(f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page={page}")
-                    for cat_id in extra_cats:
-                        for page in range(0, extra_cat_pages):
-                            method_urls.append(f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId={cat_id}&page={page}")
+                        if not (max_pages > 0 and page_cap <= 5):
+                            method_urls.append(f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=2&page={page}")
+                            method_urls.append(f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId=1&page={page}")
+                    if not (max_pages > 0 and page_cap <= 5):
+                        for cat_id in extra_cats:
+                            for page in range(0, extra_cat_pages):
+                                method_urls.append(f"{base_url}/explore?method=MostPopularCategories&maxRows={max_rows}&categoryId={cat_id}&page={page}")
             if method_urls:
                 for method_url in method_urls:
                     before_unique = len(_dedupe_venues(extracted))

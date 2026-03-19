@@ -62,6 +62,28 @@ curl -s 'http://127.0.0.1:5556/ticketing/parking-only?parking_urls=https://www.s
 - **parking_urls:** Comma-separated StubHub parking event URLs (e.g. `parking-passes-only-.../event/123/`)
 - **Output:** Same Phase 2 CSV (`phase2_parking_<timestamp>.csv`)
 
+### 5.5 Generate event + parking links only (no parking listings)
+
+This is a separate tool-style endpoint for teams who just need **event URLs and parking URLs** (Phase 1 output shape),
+without running Phase 2 parking extraction.
+
+- **Direct input (venue / performer URL):**
+
+```bash
+curl -s 'http://127.0.0.1:5556/ticketing/parking-links?stubhub_urls=https://www.stubhub.com/oakland-arena-tickets/venue/229/' --max-time 1800 -o parking_links.json
+```
+
+- **Auto venue finding from a seed page** (discovers venue links first, then runs discovery per venue):
+
+```bash
+curl -s 'http://127.0.0.1:5556/ticketing/parking-links?auto_find_venues=true&seed_url=https://www.stubhub.com/explore&max_venues=25&max_pages=3&full=true&venue_discovery_timeout_seconds=90' --max-time 1800 -o parking_links.json
+```
+
+Notes:
+- Some StubHub seed pages may return anti-bot/challenge responses. When that happens, the endpoint will return `venues_resolved=0` and include details in `venue_discovery.attempts`.
+- If auto-find is blocked, the most reliable approach is to pass known venue/performer URLs via `stubhub_urls=...`.
+- For local laptop usage, auto-find can also **fallback to `venues.xlsx`**: `fallback_to_excel=true&excel_path=venues.xlsx` (default enabled).
+
 ### 6. Optional: run phases separately
 
 - **Phase 1 only:** `GET /ticketing/phase1?source=file&export_csv=true`
@@ -126,6 +148,7 @@ ls -lt python-src/storage/monitoring | head
 ## Main endpoints
 
 - `GET /ticketing/parking-only` – parking extraction only (no venue/event discovery)
+- `GET /ticketing/parking-links` – generate event + parking links only (no parking listings). See `docs/PARKING_LINKS_TOOL.md`.
 - `GET /ticketing/pipeline/run` – full pipeline (Phase 1 → 2 → 3) or parking-only with `parking_urls`
 - `GET /ticketing/phase1` – discovery only
 - `GET /ticketing/phase2` – parking extraction (phase1_csv, parking_urls, or single event_url)

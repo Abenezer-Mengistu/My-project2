@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Parking Links Tool</title>
+    <style>
+      :root {
+        --bg: #0b1220;
+        --panel: #121a2b;
+        --text: #e7eefc;
+        --muted: #a9b6d1;
+        --border: rgba(255, 255, 255, 0.12);
+        --accent: #6ea8fe;
+        --bad: #ff6b6b;
+        --ok: #51cf66;
+        --warn: #fcc419;
+        --btn: #1f2a44;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f6f8ff;
+          --panel: #ffffff;
+          --text: #0b1220;
+          --muted: #4b5b7a;
+          --border: rgba(0, 0, 0, 0.12);
+          --accent: #2f6fed;
+          --bad: #e03131;
+          --ok: #2f9e44;
+          --warn: #f59f00;
+          --btn: #edf2ff;
+        }
+      }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+          "Segoe UI Emoji";
+        background: var(--bg);
+        color: var(--text);
+      }
+      .container {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 20px 16px 36px;
+      }
+      .header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0;
+        letter-spacing: 0.2px;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 14px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      @media (max-width: 860px) {
+        .row {
+          grid-template-columns: 1fr;
+        }
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      input[type="text"],
+      input[type="number"],
+      textarea,
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 10px;
+        padding: 10px 10px;
+        outline: none;
+      }
+      textarea {
+        min-height: 92px;
+        resize: vertical;
+        line-height: 1.3;
+      }
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 12px;
+      }
+      .leftControls,
+      .rightControls {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      button {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: var(--btn);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 10px;
+        cursor: pointer;
+      }
+      button.primary {
+        border-color: rgba(110, 168, 254, 0.5);
+        background: rgba(110, 168, 254, 0.18);
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+      }
+      .status {
+        font-size: 13px;
+        margin-top: 10px;
+        color: var(--muted);
+      }
+      .status strong {
+        color: var(--text);
+      }
+      .status .ok {
+        color: var(--ok);
+      }
+      .status .bad {
+        color: var(--bad);
+      }
+      .status .warn {
+        color: var(--warn);
+      }
+      .adv {
+        margin-top: 10px;
+      }
+      details {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 10px;
+      }
+      summary {
+        cursor: pointer;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th,
+      td {
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--border);
+        vertical-align: top;
+      }
+      th {
+        text-align: left;
+        color: var(--muted);
+        font-weight: 600;
+        position: sticky;
+        top: 0;
+        background: var(--panel);
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 12px;
+      }
+      .small {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .topbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <div>
+          <h1>Parking Links Tool</h1>
+          <div class="sub">Generate StubHub parking event links (no parking inventory scraping).</div>
+        </div>
+        <div class="topbar">
+          <span class="pill">Endpoint: <span class="mono">/ticketing/parking-links</span></span>
+          <a class="pill" href="/ticketing" target="_blank" rel="noreferrer">API help</a>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="panel">
+          <div class="row">
+            <div>
+              <label for="mode">Mode</label>
+              <select id="mode">
+                <option value="direct">Direct (paste venue / performer URL)</option>
+                <option value="auto">Auto (seed URL → venues → parking links)</option>
+              </select>
+            </div>
+            <div>
+              <label for="export_json">Export JSON</label>
+              <select id="export_json">
+                <option value="true" selected>Yes (save to storage/search_results)</option>
+                <option value="false">No (return results only)</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="directBox" class="adv">
+            <div class="row">
+              <div>
+                <label for="stubhub_urls">StubHub URL(s)</label>
+                <textarea
+                  id="stubhub_urls"
+                  placeholder="Paste one or more StubHub venue/performer URLs (comma or newline separated)&#10;Example: https://www.stubhub.com/ariana-grande-tickets/performer/511927?gridFilterType=1"
+                ></textarea>
+                <div class="small">Tip: multiple URLs can be comma-separated or one per line.</div>
+              </div>
+              <div>
+                <label for="venue_name">Venue label (optional)</label>
+                <input id="venue_name" type="text" placeholder="e.g. Ariana Grande" />
+                <div class="small">Only used for labeling results when you pass a single URL.</div>
+              </div>
+            </div>
+          </div>
+
+          <div id="autoBox" class="adv" style="display: none">
+            <div class="row">
+              <div>
+                <label for="seed_url">Seed URL</label>
+                <input id="seed_url" type="text" value="https://www.stubhub.com/explore" />
+              </div>
+              <div>
+                <label for="max_venues">Max venues</label>
+                <input id="max_venues" type="number" value="25" min="1" max="10000" />
+              </div>
+            </div>
+
+            <details class="adv">
+              <summary>Advanced options</summary>
+              <div class="row" style="margin-top: 10px">
+                <div>
+                  <label for="max_pages">Max pages (venue discovery)</label>
+                  <input id="max_pages" type="number" value="0" min="0" max="100" />
+                  <div class="small">0 = use fast laptop default. Higher = slower.</div>
+                </div>
+                <div>
+                  <label for="full">Browser-assisted discovery</label>
+                  <select id="full">
+                    <option value="false" selected>No (faster)</option>
+                    <option value="true">Yes (slower, can help)</option>
+                  </select>
+                </div>
+              </div>
+              <div class="row" style="margin-top: 10px">
+                <div>
+                  <label for="venue_discovery_timeout_seconds">Venue discovery timeout (seconds)</label>
+                  <input id="venue_discovery_timeout_seconds" type="number" value="90" min="5" max="600" />
+                </div>
+                <div>
+                  <label for="fallback_to_excel">Excel fallback</label>
+                  <select id="fallback_to_excel">
+                    <option value="true" selected>Yes (recommended)</option>
+                    <option value="false">No</option>
+                  </select>
+                </div>
+              </div>
+              <div class="row" style="margin-top: 10px">
+                <div>
+                  <label for="excel_path">Excel path</label>
+                  <input id="excel_path" type="text" value="venues.xlsx" />
+                  <div class="small">Used only if fallback is enabled.</div>
+                </div>
+                <div>
+                  <label for="strict_event_location_match">Strict event location match</label>
+                  <select id="strict_event_location_match">
+                    <option value="false" selected>No (recommended)</option>
+                    <option value="true">Yes (stricter)</option>
+                  </select>
+                </div>
+              </div>
+            </details>
+          </div>
+
+          <div class="controls">
+            <div class="leftControls">
+              <button class="primary" id="runBtn">Generate parking links</button>
+              <button id="clearBtn" type="button">Clear</button>
+            </div>
+            <div class="rightControls">
+              <button id="downloadBtn" type="button" disabled>Download latest JSON</button>
+            </div>
+          </div>
+
+          <div id="status" class="status"></div>
+        </div>
+
+        <div class="panel">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap">
+            <div>
+              <strong>Results</strong>
+              <div class="small">Event URLs and parking URLs. Copy or open in a new tab.</div>
+            </div>
+            <div class="small mono" id="resultMeta"></div>
+          </div>
+          <div
+            style="
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              gap: 10px;
+              flex-wrap: wrap;
+              margin-top: 10px;
+            "
+          >
+            <div class="leftControls">
+              <span class="pill">Rows: <span class="mono" id="rowCount">0</span></span>
+              <span class="pill">Page: <span class="mono" id="pageInfo">1 / 1</span></span>
+            </div>
+            <div class="rightControls">
+              <label class="small" style="margin: 0">
+                <span style="margin-right: 6px">Page size</span>
+                <select id="pageSize" style="width: auto; padding: 8px 10px">
+                  <option value="25" selected>25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                  <option value="250">250</option>
+                </select>
+              </label>
+              <button id="prevPage" type="button" disabled>Prev</button>
+              <button id="nextPage" type="button" disabled>Next</button>
+            </div>
+          </div>
+          <div style="overflow: auto; margin-top: 10px; max-height: 62vh">
+            <table>
+              <thead>
+                <tr>
+                  <th style="min-width: 150px">Venue</th>
+                  <th style="min-width: 220px">Event</th>
+                  <th style="min-width: 110px">Date</th>
+                  <th style="min-width: 380px">Parking URL</th>
+                  <th style="min-width: 140px">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="tbody">
+                <tr>
+                  <td colspan="5" class="small">Run the tool to see results.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const el = (id) => document.getElementById(id);
+
+      const modeEl = el("mode");
+      const directBox = el("directBox");
+      const autoBox = el("autoBox");
+      const runBtn = el("runBtn");
+      const clearBtn = el("clearBtn");
+      const downloadBtn = el("downloadBtn");
+      const statusEl = el("status");
+      const tbody = el("tbody");
+      const resultMeta = el("resultMeta");
+      const rowCountEl = el("rowCount");
+      const pageInfoEl = el("pageInfo");
+      const pageSizeEl = el("pageSize");
+      const prevPageBtn = el("prevPage");
+      const nextPageBtn = el("nextPage");
+
+      let allRows = [];
+      let currentPage = 1;
+
+      function setStatus(html) {
+        statusEl.innerHTML = html || "";
+      }
+
+      function setLoading(loading) {
+        runBtn.disabled = loading;
+        runBtn.textContent = loading ? "Working..." : "Generate parking links";
+      }
+
+      function renderRows(rows) {
+        tbody.innerHTML = "";
+        if (!rows || rows.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="5" class="small">No rows returned.</td></tr>`;
+          return;
+        }
+        for (const r of rows) {
+          const parkingUrl = r.parking_url || "";
+          const safeParking = parkingUrl.replaceAll('"', "%22");
+          tbody.insertAdjacentHTML(
+            "beforeend",
+            `<tr>
+              <td>${escapeHtml(r.venue || "")}</td>
+              <td>${escapeHtml(r.event_name || "")}</td>
+              <td class="mono">${escapeHtml(r.event_date || "")}</td>
+              <td class="mono"><a href="${safeParking}" target="_blank" rel="noreferrer">${escapeHtml(parkingUrl)}</a></td>
+              <td>
+                <button type="button" data-copy="${escapeAttr(parkingUrl)}">Copy</button>
+              </td>
+            </tr>`
+          );
+        }
+        tbody.querySelectorAll("button[data-copy]").forEach((b) => {
+          b.addEventListener("click", async () => {
+            const text = b.getAttribute("data-copy") || "";
+            await navigator.clipboard.writeText(text);
+            b.textContent = "Copied";
+            setTimeout(() => (b.textContent = "Copy"), 800);
+          });
+        });
+      }
+
+      function totalPages() {
+        const size = Number(pageSizeEl.value || 25);
+        return Math.max(1, Math.ceil((allRows.length || 0) / Math.max(1, size)));
+      }
+
+      function updatePagerUi() {
+        const tp = totalPages();
+        if (currentPage < 1) currentPage = 1;
+        if (currentPage > tp) currentPage = tp;
+        rowCountEl.textContent = String(allRows.length || 0);
+        pageInfoEl.textContent = `${currentPage} / ${tp}`;
+        prevPageBtn.disabled = currentPage <= 1 || allRows.length === 0;
+        nextPageBtn.disabled = currentPage >= tp || allRows.length === 0;
+      }
+
+      function renderCurrentPage() {
+        updatePagerUi();
+        const size = Number(pageSizeEl.value || 25);
+        const start = (currentPage - 1) * size;
+        const end = start + size;
+        renderRows(allRows.slice(start, end));
+      }
+
+      function escapeHtml(str) {
+        return (str || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function escapeAttr(str) {
+        return escapeHtml(str).replaceAll("\n", " ").trim();
+      }
+
+      function payloadFromForm() {
+        const mode = modeEl.value;
+        const export_json = el("export_json").value;
+        if (mode === "auto") {
+          return {
+            mode: "auto",
+            export_json: export_json,
+            seed_url: el("seed_url").value.trim(),
+            max_venues: el("max_venues").value,
+            max_pages: el("max_pages").value,
+            full: el("full").value,
+            venue_discovery_timeout_seconds: el("venue_discovery_timeout_seconds").value,
+            fallback_to_excel: el("fallback_to_excel").value,
+            excel_path: el("excel_path").value.trim(),
+            strict_event_location_match: el("strict_event_location_match").value,
+            strict_venue_guard: true,
+          };
+        }
+        return {
+          mode: "direct",
+          export_json: export_json,
+          stubhub_urls: el("stubhub_urls").value.trim(),
+          venue_name: el("venue_name").value.trim(),
+          strict_event_location_match: false,
+          strict_venue_guard: true,
+        };
+      }
+
+      async function run() {
+        setLoading(true);
+        setStatus(`<span class="warn">Running…</span>`);
+        downloadBtn.disabled = true;
+        resultMeta.textContent = "";
+        try {
+          const resp = await fetch("/ui/parking-links/run", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payloadFromForm()),
+          });
+          const data = await resp.json();
+          if (!data || data.success !== true) {
+            setStatus(`<span class="bad">Error:</span> ${escapeHtml((data && data.error) || "Request failed")}`);
+            renderRows([]);
+            return;
+          }
+
+          const venuesResolved = data.venues_resolved ?? 0;
+          const eventsGenerated = data.events_generated ?? 0;
+          const jsonOutput = data.json_output;
+
+          let msg = `<span class="ok">Success.</span> venues_resolved=<strong>${venuesResolved}</strong>, events_generated=<strong>${eventsGenerated}</strong>`;
+
+          const vd = data.venue_discovery || null;
+          if (vd && Array.isArray(vd.attempts)) {
+            const extracted = vd.attempts.reduce((acc, a) => acc + (a.venues_extracted || 0), 0);
+            if (extracted === 0 && venuesResolved > 0) {
+              msg += ` — <span class="warn">Seed scrape produced 0 venues; used Excel fallback.</span>`;
+            }
+          }
+
+          if (jsonOutput) {
+            msg += `<div class="small">Saved: <span class="mono">${escapeHtml(jsonOutput)}</span></div>`;
+            downloadBtn.disabled = false;
+          }
+          setStatus(msg);
+          resultMeta.textContent = jsonOutput ? `export: ${jsonOutput}` : "";
+          allRows = Array.isArray(data.data) ? data.data : [];
+          currentPage = 1;
+          renderCurrentPage();
+        } catch (e) {
+          setStatus(`<span class="bad">Error:</span> ${escapeHtml(String(e))}`);
+          allRows = [];
+          currentPage = 1;
+          renderCurrentPage();
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      modeEl.addEventListener("change", () => {
+        const mode = modeEl.value;
+        directBox.style.display = mode === "direct" ? "block" : "none";
+        autoBox.style.display = mode === "auto" ? "block" : "none";
+        setStatus("");
+      });
+
+      runBtn.addEventListener("click", run);
+      clearBtn.addEventListener("click", () => {
+        el("stubhub_urls").value = "";
+        el("venue_name").value = "";
+        setStatus("");
+        resultMeta.textContent = "";
+        downloadBtn.disabled = true;
+        allRows = [];
+        currentPage = 1;
+        renderCurrentPage();
+      });
+
+      downloadBtn.addEventListener("click", () => {
+        window.location.href = "/ui/parking-links/download";
+      });
+
+      pageSizeEl.addEventListener("change", () => {
+        currentPage = 1;
+        renderCurrentPage();
+      });
+      prevPageBtn.addEventListener("click", () => {
+        currentPage = Math.max(1, currentPage - 1);
+        renderCurrentPage();
+      });
+      nextPageBtn.addEventListener("click", () => {
+        currentPage = Math.min(totalPages(), currentPage + 1);
+        renderCurrentPage();
+      });
+
+      // Initialize pager state on load.
+      renderCurrentPage();
+    </script>
+  </body>
+</html>
+
