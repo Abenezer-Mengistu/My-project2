@@ -99,6 +99,14 @@
         padding: 10px 10px;
         outline: none;
       }
+
+      /* Some browsers render the native dropdown option list with default colors.
+         Force it to match our theme so text stays readable in dark mode. */
+      option {
+        background: var(--panel);
+        color: var(--text);
+      }
+
       textarea {
         min-height: 92px;
         resize: vertical;
