@@ -137,6 +137,24 @@ class StubHubDiscoveryScraper(TicketingPlaywrightBase):
         new_query = urlencode({k: v[0] for k, v in qs.items()})
         return urlunparse(parsed._replace(query=new_query))
 
+    @staticmethod
+    def _page_urls(url: str, max_pages: int) -> list[str]:
+        """
+        Build a conservative sequence of pagination URLs.
+
+        StubHub pages are inconsistent about whether the second page is `page=1`
+        or `page=2`. We include both styles after the base URL and rely on
+        downstream event de-duplication to collapse duplicates safely.
+        """
+        urls: list[str] = [url]
+        seen = {url}
+        for page in range(1, max_pages + 1):
+            page_url = StubHubDiscoveryScraper._with_page_param(url, page)
+            if page_url not in seen:
+                seen.add(page_url)
+                urls.append(page_url)
+        return urls
+
     async def _safe_page_title(self) -> str:
         try:
             return (await self.page.title()).strip()
@@ -336,6 +354,13 @@ class StubHubDiscoveryScraper(TicketingPlaywrightBase):
                     name = await el.get_attribute("title")
 
                 raw_href = await el.get_attribute("href")
+                if not raw_href:
+                    try:
+                        link = await el.query_selector("a[href*='/event/']")
+                        if link:
+                            raw_href = await link.get_attribute("href")
+                    except Exception:
+                        pass
                 event_url = self._normalize_event_url(raw_href)
                 if not event_url:
                     continue
@@ -443,8 +468,8 @@ class StubHubDiscoveryScraper(TicketingPlaywrightBase):
 
             return page_events
 
-        for page_index in range(1, max_pages + 1):
-            page_url = url if page_index == 1 else self._with_page_param(url, page_index)
+        page_urls = self._page_urls(url, max_pages=max_pages)
+        for page_index, page_url in enumerate(page_urls, start=1):
             # StubHub event pages can be slow; use longer timeout and "commit" to avoid domcontentloaded stall
             for attempt in range(3):
                 try:

@@ -263,7 +263,10 @@
                   id="stubhub_urls"
                   placeholder="Paste one or more StubHub venue/performer URLs (comma or newline separated)&#10;Example: https://www.stubhub.com/ariana-grande-tickets/performer/511927?gridFilterType=1"
                 ></textarea>
-                <div class="small">Tip: multiple URLs can be comma-separated or one per line.</div>
+                <div class="small">
+                  Tip: multiple URLs can be comma-separated or one per line. The scraper will automatically continue
+                  through StubHub event/date pages; you do not need to copy page 2, page 3, etc. manually.
+                </div>
               </div>
               <div>
                 <label for="venue_name">Venue label (optional)</label>
@@ -348,7 +351,10 @@
           <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap">
             <div>
               <strong>Results</strong>
-              <div class="small">Event URLs and parking URLs. Copy or open in a new tab.</div>
+              <div class="small">
+                Event URLs and parking URLs. Copy or open in a new tab. The page controls below only page the results
+                table in this browser.
+              </div>
             </div>
             <div class="small mono" id="resultMeta"></div>
           </div>
@@ -364,7 +370,7 @@
           >
             <div class="leftControls">
               <span class="pill">Rows: <span class="mono" id="rowCount">0</span></span>
-              <span class="pill">Page: <span class="mono" id="pageInfo">1 / 1</span></span>
+              <span class="pill">Results page: <span class="mono" id="pageInfo">1 / 1</span></span>
             </div>
             <div class="rightControls">
               <label class="small" style="margin: 0">
