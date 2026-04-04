@@ -195,6 +195,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             normalized = StubHubParkingScraper._normalize_raw_price(obj.get("rawPrice"))
             if normalized is not None:
                 return str(normalized)
+        for key in ["currentPrice", "priceWithFees", "displayPrice", "priceInfo", "priceDisplay"]:
+            nested = obj.get(key)
+            if isinstance(nested, dict):
+                for nk in ["formatted", "display", "amount", "value", "formattedPrice", "rawPrice"]:
+                    if nk in nested and nested[nk] is not None:
+                        return str(nested[nk])
         for key in ["displayPrice", "priceInfo"]:
             if isinstance(obj.get(key), dict):
                 nested = obj[key]
@@ -202,6 +208,70 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     if nk in nested and nested[nk] is not None:
                         return str(nested[nk])
         return None
+
+    async def _count_visible_listing_nodes(self) -> int:
+        selectors = [
+            'div[role="button"].sc-194s59m-4',
+            '[data-testid*="listing"]',
+            'div[data-listing-id]',
+            '[role="listitem"]',
+        ]
+        max_count = 0
+        for selector in selectors:
+            try:
+                max_count = max(max_count, await self.page.locator(selector).count())
+            except Exception:
+                continue
+        return max_count
+
+    async def _load_all_listing_inventory(self) -> None:
+        stable_rounds = 0
+        last_visible_count = -1
+
+        for _ in range(24):
+            try:
+                show_more = self.page.get_by_role("button", name=re.compile("Show more|See more|Load more", re.IGNORECASE))
+                if await show_more.count() > 0 and await show_more.first.is_visible():
+                    await show_more.first.click()
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            try:
+                await self.page.evaluate(
+                    """() => {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        const candidates = Array.from(document.querySelectorAll('div, section, ul, main'))
+                            .filter((el) => {
+                                const style = window.getComputedStyle(el);
+                                const scrollable = el.scrollHeight > (el.clientHeight + 40);
+                                const overflowY = style.overflowY || '';
+                                return scrollable && ['auto', 'scroll'].includes(overflowY);
+                            })
+                            .sort((a, b) => b.scrollHeight - a.scrollHeight)
+                            .slice(0, 8);
+                        for (const el of candidates) {
+                            try { el.scrollTop = el.scrollHeight; } catch (e) {}
+                        }
+                    }"""
+                )
+            except Exception:
+                pass
+
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                await asyncio.sleep(1.2)
+
+            visible_count = await self._count_visible_listing_nodes()
+            if visible_count <= last_visible_count:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+            last_visible_count = max(last_visible_count, visible_count)
+
+            if stable_rounds >= 4:
+                break
 
     @staticmethod
     def _collect_listing_objects(root) -> list[dict]:
@@ -843,12 +913,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     url_l = resp.url.lower()
                     interesting = any(
                         token in url_l
-                        for token in ["event", "listing", "inventory", "map", "log", "telemetry"]
+                        for token in ["event", "listing", "inventory", "map", "log", "telemetry", "api", "search", "tickets"]
                     )
                     if not interesting and "json" not in ct:
                         return
                     txt = await resp.text()
-                    if any(k in txt for k in ["visiblePopups", "listingId", "formattedPrice", "rawPrice", "listings", "listing", "availableQuantity"]):
+                    if any(k in txt for k in ["visiblePopups", "listingId", "formattedPrice", "rawPrice", "listings", "listing", "availableQuantity", "ticketClassName", "sectionName", "zoneName", "currentPrice", "priceWithFees"]):
                         captured_payloads.append(txt)
                         captured_urls.append(resp.url)
                 except Exception:
@@ -859,7 +929,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     pd = req.post_data or ""
                     if not pd:
                         return
-                    if any(k in pd for k in ["visiblePopups", "VisibleSectionPopupsOnLoad", "listingId", "rawPrice", "formattedPrice"]):
+                    if any(k in pd for k in ["visiblePopups", "VisibleSectionPopupsOnLoad", "listingId", "rawPrice", "formattedPrice", "currentPrice", "priceWithFees"]):
                         captured_request_payloads.append(pd)
                         captured_request_urls.append(req.url)
                 except Exception:
@@ -878,41 +948,9 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             await self.human_delay()
             await asyncio.sleep(2)
             
-            # Handle "Show more" button and lazy loading
-            logger.info("[Scraper] Checking for 'Show more' buttons...")
+            logger.info("[Scraper] Expanding and scrolling listing inventory...")
             try:
-                for i in range(15):  # Safety limit for clicking Show More
-                    show_more = self.page.get_by_role("button", name=re.compile("Show more", re.IGNORECASE))
-                    if await show_more.is_visible():
-                        logger.info(f"[Scraper] Clicking 'Show more' (iteration {i+1})...")
-                        await show_more.click()
-                        await asyncio.sleep(1.5)
-                    else:
-                        break
-                
-                # Final scroll to trigger hidden elements
-                logger.info("[Scraper] Performing final scrolls...")
-                for i in range(5):
-                    await self.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(0.5)
-                    await asyncio.sleep(1.0)
-
-                # Scroll inside listings panel if it's virtualized
-                for _ in range(10):
-                    await self.page.evaluate(
-                        """() => {
-                            const candidates = [
-                              document.querySelector('[data-testid*="list"]'),
-                              document.querySelector('[data-testid*="listings"]'),
-                              document.querySelector('[role="list"]'),
-                              document.querySelector('div[aria-label*="list"]'),
-                            ].filter(Boolean);
-                            for (const el of candidates) {
-                              try { el.scrollTop = el.scrollHeight; } catch (e) {}
-                            }
-                        }"""
-                    )
-                    await asyncio.sleep(0.8)
+                await self._load_all_listing_inventory()
             except Exception:
                 pass
 

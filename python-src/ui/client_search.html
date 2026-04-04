@@ -355,6 +355,40 @@
         font-size: 12px;
         background: var(--panel-2);
       }
+      .eventActions {
+        margin-top: 12px;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .miniButton {
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 7px 10px;
+        font: inherit;
+        font-size: 12px;
+        color: var(--text);
+        background: var(--panel-2);
+        cursor: pointer;
+      }
+      .scrapeBadge {
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        padding: 7px 10px;
+        font-size: 12px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .scrapeBadge.loading {
+        color: var(--warn);
+      }
+      .scrapeBadge.done {
+        color: var(--ok);
+      }
+      .scrapeBadge.error {
+        color: var(--bad);
+      }
       .listingGrid {
         margin-top: 16px;
         display: grid;
@@ -483,6 +517,7 @@
       let currentSelection = null;
       let currentParkingQuery = "";
       let loadingPhaseIndex = 0;
+      let progressiveRunId = 0;
 
       function escapeHtml(str) {
         return String(str || "")
@@ -671,6 +706,10 @@
                         <div>${escapeHtml(card.venue_name || "")}</div>
                         <div><a class="eventLink" href="${escapeHtml(card.parking_url)}" target="_blank" rel="noreferrer">Open parking event on StubHub</a></div>
                       </div>
+                      <div class="eventActions">
+                        <span class="scrapeBadge ${escapeHtml(card.scrape_state || "queued")}">${escapeHtml(card.scrape_label || "Queued for listing scrape")}</span>
+                        <button class="miniButton" type="button" data-reload-url="${escapeHtml(card.parking_url)}">Load listings</button>
+                      </div>
                     </div>
                     <div class="countPill">${escapeHtml(String(card.listing_count || 0))} listings</div>
                   </div>
@@ -680,6 +719,83 @@
             `;
           })
           .join("");
+
+        resultsEl.querySelectorAll("[data-reload-url]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const parkingUrl = button.getAttribute("data-reload-url");
+            const card = currentCards.find((item) => item.parking_url === parkingUrl);
+            if (card) {
+              loadEventListings(card, progressiveRunId);
+            }
+          });
+        });
+      }
+
+      function updateCard(cardUpdate) {
+        currentCards = currentCards.map((card) => {
+          if (card.parking_url !== cardUpdate.parking_url) {
+            return card;
+          }
+          return { ...card, ...cardUpdate };
+        });
+        renderResults(currentCards);
+      }
+
+      async function loadEventListings(card, runId) {
+        if (!card || !card.parking_url || runId !== progressiveRunId) {
+          return;
+        }
+        updateCard({
+          ...card,
+          scrape_state: "loading",
+          scrape_label: "Loading listings...",
+        });
+
+        try {
+          const resp = await fetch("/ticketing/ui/client-search/event-details", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(card),
+          });
+          const data = await resp.json();
+          if (!data || data.success !== true) {
+            throw new Error((data && data.error) || "Listing scrape failed");
+          }
+          if (runId !== progressiveRunId) {
+            return;
+          }
+          const nextCard = {
+            ...(data.card || card),
+            scrape_state: "done",
+            scrape_label: `Loaded ${Number((data.card && data.card.listing_count) || 0)} listings`,
+          };
+          updateCard(nextCard);
+        } catch (error) {
+          if (runId !== progressiveRunId) {
+            return;
+          }
+          updateCard({
+            ...card,
+            scrape_state: "error",
+            scrape_label: "Listing load failed",
+          });
+        }
+      }
+
+      async function progressiveLoadListings(runId) {
+        const cards = [...currentCards];
+        const concurrency = 2;
+        let index = 0;
+
+        async function worker() {
+          while (index < cards.length && runId === progressiveRunId) {
+            const card = cards[index];
+            index += 1;
+            await loadEventListings(card, runId);
+          }
+        }
+
+        await Promise.all(Array.from({ length: concurrency }, () => worker()));
       }
 
       function flattenCards(cards) {
@@ -812,13 +928,15 @@
         currentCards = [];
         currentParkingQuery = "";
         setDownloadEnabled(false);
+        progressiveRunId += 1;
+        const runId = progressiveRunId;
         loadingPhaseIndex = 0;
         setLoading(true);
         startRunTimer();
-        setStatus(`<span class="warn">Loading parking events and listings...</span>`);
+        setStatus(`<span class="warn">Discovering parking events...</span>`);
         resultsEl.innerHTML = loadingMarkup(selection.title || selection.query || "");
         const phaseTimer = setInterval(() => {
-          loadingPhaseIndex = Math.min(3, loadingPhaseIndex + 1);
+          loadingPhaseIndex = Math.min(1, loadingPhaseIndex + 1);
           resultsEl.innerHTML = loadingMarkup(selection.title || selection.query || "");
         }, 18000);
 
@@ -836,16 +954,34 @@
           const found = Number(data.parking_events_found || 0);
           const scraped = Number(data.parking_events_scraped || 0);
           currentParkingQuery = data.parking_query || "";
+          const initialCards = (Array.isArray(data.data) ? data.data : []).map((card) => ({
+            ...card,
+            scrape_state: "queued",
+            scrape_label: "Queued for listing scrape",
+          }));
           setStatus(
-            `<span class="ok">Loaded.</span> Query <span class="mono">${escapeHtml(data.parking_query || "")}</span> matched <strong>${found}</strong> parking events and scraped <strong>${scraped}</strong>.`
+            `<span class="ok">Events loaded.</span> Query <span class="mono">${escapeHtml(data.parking_query || "")}</span> matched <strong>${found}</strong> parking events. Listing details are now loading progressively.`
           );
-          renderResults(Array.isArray(data.data) ? data.data : []);
+          renderResults(initialCards);
         } catch (error) {
           setStatus(`<span class="bad">Error:</span> ${escapeHtml(String(error))}`);
           resultsEl.innerHTML = `<div class="empty">The parking search failed. Try a different suggestion.</div>`;
         } finally {
           clearInterval(phaseTimer);
           setLoading(false);
+        }
+
+        if (runId === progressiveRunId && currentCards.length) {
+          progressiveLoadListings(runId).then(() => {
+            if (runId !== progressiveRunId) {
+              return;
+            }
+            const loaded = currentCards.filter((card) => card.scrape_state === "done").length;
+            const failed = currentCards.filter((card) => card.scrape_state === "error").length;
+            setStatus(
+              `<span class="ok">Progressive load finished.</span> Query <span class="mono">${escapeHtml(currentParkingQuery || "")}</span> discovered <strong>${currentCards.length}</strong> parking events, loaded <strong>${loaded}</strong>, failed <strong>${failed}</strong>.`
+            );
+          });
         }
       }
 
