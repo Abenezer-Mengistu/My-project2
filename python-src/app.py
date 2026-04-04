@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import re
-from urllib.parse import unquote, urlsplit, urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import unquote, urlsplit, urlparse, parse_qs, urlencode, urlunparse, urljoin
 import httpx
 
 from fastapi import FastAPI, Request
@@ -47,6 +47,7 @@ from utils.pricing import (
     compute_listing_metrics,
     check_price_thresholds,
     currency_from_listing,
+    set_usd_exchange_rates,
 )
 from utils.export_shaping import create_event_result, flatten_event_result
 from utils.functions import retry
@@ -79,6 +80,10 @@ _phase3_scheduler_state: dict = {
     "last_run_at": None,
     "last_result": None,
     "last_error": None,
+}
+_stubhub_rates_cache: dict[str, object] = {
+    "updated_at": None,
+    "rates": None,
 }
 
 
@@ -254,6 +259,300 @@ def _latest_search_result() -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _stubhub_browser_headers() -> dict[str, str]:
+    return {
+        "User-Agent": CONFIG["app"]["default_user_agent"],
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+async def _refresh_stubhub_usd_rates(force: bool = False) -> dict[str, str] | None:
+    now = time.time()
+    updated_at = _stubhub_rates_cache.get("updated_at")
+    if not force and updated_at and (now - float(updated_at)) < 1800 and _stubhub_rates_cache.get("rates"):
+        return _stubhub_rates_cache.get("rates")  # type: ignore[return-value]
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=20.0,
+        headers=_stubhub_browser_headers(),
+    ) as client:
+        response = await client.get("https://www.stubhub.com/secure/Browse/DefaultMaster/GetLocationSettings")
+        response.raise_for_status()
+        payload = response.json()
+
+    currencies = payload.get("currencies") or []
+    eur_rates: dict[str, float] = {}
+    for item in currencies:
+        try:
+            code = str(item.get("code") or "").upper()
+            rate = float(item.get("currentRate"))
+        except Exception:
+            continue
+        if code and rate > 0:
+            eur_rates[code] = rate
+
+    usd_rate = eur_rates.get("USD")
+    if not usd_rate:
+        return None
+
+    usd_multipliers = {code: (usd_rate / rate) for code, rate in eur_rates.items() if rate > 0}
+    usd_multipliers["USD"] = 1.0
+    set_usd_exchange_rates(usd_multipliers)
+    _stubhub_rates_cache["updated_at"] = now
+    _stubhub_rates_cache["rates"] = {k: f"{v:.12f}" for k, v in usd_multipliers.items()}
+    return _stubhub_rates_cache.get("rates")  # type: ignore[return-value]
+
+
+def _canonical_stubhub_url(url: str | None) -> str | None:
+    normalized = _normalize_stubhub_url(url)
+    if not normalized:
+        return None
+    parts = urlsplit(normalized)
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+async def _fetch_stubhub_search_index(query: str, page: int = 0) -> dict:
+    search_query = (query or "").strip()
+    if not search_query:
+        raise ValueError("query is required")
+    page = max(0, int(page or 0))
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=30.0,
+        headers=_stubhub_browser_headers(),
+    ) as client:
+        response = await client.get(
+            "https://www.stubhub.com/secure/search/",
+            params={"q": search_query, "page": page},
+        )
+        response.raise_for_status()
+
+    match = re.search(
+        r'<script id="index-data" type="application/json">(.*?)</script>',
+        response.text,
+        re.DOTALL,
+    )
+    if not match:
+        raise ValueError("StubHub search response did not include index-data JSON.")
+
+    try:
+        return json.loads(html.unescape(match.group(1)))
+    except Exception as exc:
+        raise ValueError("Failed to parse StubHub search results.") from exc
+
+
+def _stubhub_search_grid_items(index_data: dict) -> list[dict]:
+    grids = index_data.get("eventGrids") or {}
+    items: list[dict] = []
+    if isinstance(grids, dict):
+        for grid in grids.values():
+            if isinstance(grid, dict):
+                raw_items = grid.get("items") or []
+                if isinstance(raw_items, list):
+                    items.extend([item for item in raw_items if isinstance(item, dict)])
+    return items
+
+
+async def _fetch_stubhub_search_grid_items_paginated(query: str, max_pages: int = 5) -> list[dict]:
+    seen: set[str] = set()
+    combined: list[dict] = []
+
+    for page in range(max(1, max_pages)):
+        index_data = await _fetch_stubhub_search_index(query, page=page)
+        page_items = _stubhub_search_grid_items(index_data)
+        if not page_items:
+            break
+
+        new_count = 0
+        for item in page_items:
+            canonical = _canonical_stubhub_url(item.get("url"))
+            dedupe_key = canonical or json.dumps(item, sort_keys=True, default=str)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            combined.append(item)
+            new_count += 1
+
+        if new_count == 0 or len(page_items) < 20:
+            break
+
+    return combined
+
+
+def _stubhub_selection_type(url: str | None) -> str:
+    value = (url or "").lower()
+    if "/performer/" in value:
+        return "performer"
+    if "/venue/" in value:
+        return "venue"
+    if "/grouping/" in value:
+        return "grouping"
+    if "/category/" in value:
+        return "category"
+    if "/event/" in value:
+        return "event"
+    return "unknown"
+
+
+def _build_client_search_suggestions(index_data: dict, limit: int = 12) -> list[dict]:
+    suggestions: list[dict] = []
+    seen: set[str] = set()
+
+    def add_suggestion(item: dict, source: str) -> None:
+        raw_url = item.get("url")
+        absolute_url = _normalize_stubhub_url(urljoin("https://www.stubhub.com", raw_url or ""))
+        canonical_url = _canonical_stubhub_url(absolute_url)
+        if not canonical_url or canonical_url in seen:
+            return
+
+        selection_type = _stubhub_selection_type(canonical_url)
+        if selection_type == "unknown":
+            return
+
+        suggestion = {
+            "title": item.get("title") or item.get("name") or "",
+            "subtitle": item.get("subtitle") or "",
+            "url": absolute_url,
+            "canonical_url": canonical_url,
+            "source": source,
+            "selection_type": selection_type,
+            "location": item.get("formattedVenueLocation") or "",
+            "venue_name": item.get("venueName") or "",
+            "date": item.get("formattedDate") or "",
+            "time": item.get("formattedTime") or "",
+            "is_parking_event": bool(item.get("isParkingEvent")),
+            "relationship_count": item.get("numberRelationships"),
+        }
+        if not suggestion["title"]:
+            return
+        seen.add(canonical_url)
+        suggestions.append(suggestion)
+
+    for item in (index_data.get("topSearchResults") or {}).get("searchResults", []) or []:
+        if len(suggestions) >= limit:
+            break
+        if isinstance(item, dict):
+            add_suggestion(item, "top")
+
+    if len(suggestions) < limit:
+        for item in _stubhub_search_grid_items(index_data):
+            if len(suggestions) >= limit:
+                break
+            if isinstance(item, dict) and not item.get("isParkingEvent"):
+                add_suggestion(item, "event")
+
+    return suggestions[:limit]
+
+
+def _build_parking_query_from_selection(payload: dict) -> str:
+    title = (payload.get("title") or payload.get("query") or "").strip()
+    location = (payload.get("location") or "").strip()
+    venue_name = (payload.get("venue_name") or "").strip()
+    source = (payload.get("source") or "").strip().lower()
+
+    if not title:
+        raise ValueError("title or query is required")
+
+    query_parts = ["parking passes only", title]
+    if source == "event":
+        city = location.split(",", 1)[0].strip() if location else ""
+        if city and city.lower() not in title.lower():
+            query_parts.append(city)
+        elif venue_name and venue_name.lower() not in title.lower():
+            query_parts.append(venue_name)
+
+    return " ".join(part for part in query_parts if part).strip()
+
+
+def _price_display_for_row(row: dict) -> str:
+    price = row.get("price")
+    currency = (row.get("currency") or "").upper()
+    if price in (None, ""):
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        raw_price = (details.get("price_incl_fees") or "").strip()
+        if raw_price:
+            return raw_price
+        return ""
+    if currency == "USD":
+        return f"${price}"
+    if currency:
+        return f"{currency} {price}"
+    return str(price)
+
+
+def _clean_listing_notes(value: str | None, lot_name: str | None = None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if lot_name and text.startswith(lot_name):
+        text = text[len(lot_name):].strip()
+    text = re.sub(r"(?<=\w)(\d+\s+pass(?:es)?)", r" \1", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<!^)(Over a )", r" | \1", text)
+    text = re.sub(r"(?<!^)(Buyer could receive)", r" | \1", text)
+    text = re.sub(r"(?<!^)(Last pass(?:es)?)", r" | \1", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<!^)(Amazing|Great|Good)", r" | \1", text)
+    text = re.sub(r"\s+", " ", text).strip(" |")
+    return text
+
+
+def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> list[dict]:
+    meta_by_url: dict[str, dict] = {}
+    for item in search_items:
+        canonical = _canonical_stubhub_url(item.get("url"))
+        if canonical:
+            meta_by_url[canonical] = item
+
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        canonical = _canonical_stubhub_url(row.get("parking_url") or row.get("event_url"))
+        if not canonical:
+            continue
+        meta = meta_by_url.get(canonical, {})
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        group = grouped.setdefault(
+            canonical,
+            {
+                "event_name": meta.get("name") or row.get("event_name") or "",
+                "day_of_week": meta.get("dayOfWeek") or "",
+                "formatted_date": meta.get("formattedDate") or row.get("event_date") or "",
+                "formatted_time": meta.get("formattedTime") or "",
+                "venue_name": meta.get("venueName") or "",
+                "location": meta.get("formattedVenueLocation") or "",
+                "parking_url": canonical,
+                "listing_count": 0,
+                "sort_ts": (((meta.get("eventMetadata") or {}).get("common") or {}).get("eventStartDateTime") or 0),
+                "listings": [],
+            },
+        )
+        group["listings"].append(
+            {
+                "lot_name": row.get("lot_name") or details.get("title") or "",
+                "availability": row.get("availability") or details.get("availability") or "",
+                "price_display": _price_display_for_row(row),
+                "price_value": row.get("price"),
+                "rating": details.get("rating") or "",
+                "notes": _clean_listing_notes(details.get("notes"), row.get("lot_name") or details.get("title")),
+                "listing_id": row.get("listing_id"),
+                "raw_details": row.get("listing_details"),
+            }
+        )
+
+    results = []
+    for group in grouped.values():
+        group["listings"].sort(
+            key=lambda item: float(item["price_value"]) if str(item.get("price_value") or "").replace(".", "", 1).isdigit() else float("inf")
+        )
+        group["listing_count"] = len(group["listings"])
+        results.append(group)
+
+    results.sort(key=lambda item: (item.get("sort_ts") or 0, item.get("event_name") or ""))
+    for item in results:
+        item.pop("sort_ts", None)
+    return results
+
+
 @app.get("/ui/parking-links", response_class=HTMLResponse)
 async def ui_parking_links():
     page = UI_DIR / "parking_links.html"
@@ -263,6 +562,107 @@ async def ui_parking_links():
             status_code=500,
         )
     return HTMLResponse(page.read_text(encoding="utf-8"))
+
+
+@app.get("/ticketing/ui/client-search", response_class=HTMLResponse)
+async def ui_client_search():
+    page = UI_DIR / "client_search.html"
+    if not page.exists():
+        return HTMLResponse(
+            "<h2>UI not found</h2><p>Missing file: python-src/ui/client_search.html</p>",
+            status_code=500,
+        )
+    return HTMLResponse(page.read_text(encoding="utf-8"))
+
+
+@app.get("/ticketing/ui/client-search/suggest")
+async def ui_client_search_suggest(q: str = "", limit: int = 12):
+    query = (q or "").strip()
+    if len(query) < 2:
+        return {"success": True, "query": query, "suggestions": []}
+    if limit < 1:
+        limit = 1
+    if limit > 20:
+        limit = 20
+
+    try:
+        index_data = await _fetch_stubhub_search_index(query)
+        suggestions = _build_client_search_suggestions(index_data, limit=limit)
+        return {"success": True, "query": query, "suggestions": suggestions}
+    except Exception as exc:
+        logger.warning(f"Client search suggest failed for query={query!r}: {exc}")
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
+
+
+@app.post("/ticketing/ui/client-search/run")
+async def ui_client_search_run(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: dict = {}
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    max_events_raw = payload.get("max_events")
+    try:
+        max_events = int(max_events_raw) if max_events_raw is not None else 48
+    except Exception:
+        max_events = 48
+    max_events = max(1, min(60, max_events))
+
+    try:
+        parking_query = _build_parking_query_from_selection(payload)
+        parking_candidates = [
+            item for item in await _fetch_stubhub_search_grid_items_paginated(
+                parking_query,
+                max_pages=max(3, min(8, (max_events + 19) // 20 + 2)),
+            )
+            if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
+        ]
+        if not parking_candidates:
+            return {
+                "success": True,
+                "query": (payload.get("query") or "").strip(),
+                "parking_query": parking_query,
+                "parking_events_found": 0,
+                "parking_events_scraped": 0,
+                "data": [],
+                "errors": [],
+            }
+
+        selected_candidates = parking_candidates[:max_events]
+        parking_urls = [
+            _canonical_stubhub_url(item.get("url"))
+            for item in selected_candidates
+            if _canonical_stubhub_url(item.get("url"))
+        ]
+
+        phase2_result = await ticketing_phase2(
+            parking_urls=",".join(parking_urls),
+            limit=len(parking_urls),
+            batch_size=min(4, max(1, len(parking_urls))),
+            export_json=False,
+            persist=False,
+            alert_on_failures=False,
+        )
+        if isinstance(phase2_result, JSONResponse):
+            return phase2_result
+
+        grouped_results = _group_client_search_results(selected_candidates, phase2_result.get("data") or [])
+        return {
+            "success": True,
+            "query": (payload.get("query") or "").strip(),
+            "selection_title": (payload.get("title") or payload.get("query") or "").strip(),
+            "parking_query": parking_query,
+            "parking_events_found": len(parking_candidates),
+            "parking_events_scraped": len(selected_candidates),
+            "data": grouped_results,
+            "errors": phase2_result.get("errors") or [],
+        }
+    except Exception as exc:
+        logger.error(f"Client search run failed: {exc}")
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
 
 
 @app.post("/ui/parking-links/run")
@@ -1951,6 +2351,11 @@ async def ticketing_phase2(
 ):
     if limit < 1 or batch_size < 1:
         return JSONResponse({"success": False, "error": "limit and batch_size must be >= 1"}, status_code=400)
+
+    try:
+        await _refresh_stubhub_usd_rates()
+    except Exception as exc:
+        logger.warning(f"StubHub USD rate refresh failed; continuing with cached/default rates: {exc}")
 
     event_rows: list[dict] = []
     if parking_urls:

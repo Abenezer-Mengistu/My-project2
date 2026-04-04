@@ -88,6 +88,23 @@ USD_EXCHANGE_RATES = {
 }
 
 
+def set_usd_exchange_rates(rates: dict[str, Decimal | str | float]) -> None:
+    """
+    Replace the in-memory USD conversion table with fresher values.
+    Values are direct multipliers to USD, e.g. 1 ZAR * rate => USD amount.
+    """
+    normalized: dict[str, Decimal] = {}
+    for code, value in (rates or {}).items():
+        try:
+            normalized[str(code).upper()] = Decimal(str(value))
+        except Exception:
+            continue
+    if "USD" not in normalized:
+        normalized["USD"] = Decimal("1.00")
+    USD_EXCHANGE_RATES.clear()
+    USD_EXCHANGE_RATES.update(normalized)
+
+
 def convert_to_usd(amount: Decimal | None, from_currency: str) -> Decimal | None:
     """
     Convert a Decimal amount to USD based on the source currency.

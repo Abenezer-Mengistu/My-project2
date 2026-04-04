@@ -221,6 +221,16 @@
         gap: 10px;
         flex-wrap: wrap;
       }
+      .searchBox {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 10px;
+      }
+      .searchBox input[type="text"] {
+        flex: 1 1 320px;
+      }
     </style>
   </head>
   <body>
@@ -386,6 +396,15 @@
               <button id="nextPage" type="button" disabled>Next</button>
             </div>
           </div>
+          <div class="searchBox">
+            <input
+              id="resultSearch"
+              type="text"
+              placeholder="Search venue, event, date, or parking URL"
+              autocomplete="off"
+            />
+            <span class="pill">Filtered: <span class="mono" id="filteredCount">0</span></span>
+          </div>
           <div style="overflow: auto; margin-top: 10px; max-height: 62vh">
             <table>
               <thead>
@@ -421,12 +440,15 @@
       const tbody = el("tbody");
       const resultMeta = el("resultMeta");
       const rowCountEl = el("rowCount");
+      const filteredCountEl = el("filteredCount");
       const pageInfoEl = el("pageInfo");
       const pageSizeEl = el("pageSize");
       const prevPageBtn = el("prevPage");
       const nextPageBtn = el("nextPage");
+      const resultSearchEl = el("resultSearch");
 
       let allRows = [];
+      let filteredRows = [];
       let currentPage = 1;
 
       function setStatus(html) {
@@ -470,27 +492,59 @@
         });
       }
 
+      function getActiveRows() {
+        return filteredRows;
+      }
+
       function totalPages() {
         const size = Number(pageSizeEl.value || 25);
-        return Math.max(1, Math.ceil((allRows.length || 0) / Math.max(1, size)));
+        return Math.max(1, Math.ceil((getActiveRows().length || 0) / Math.max(1, size)));
       }
 
       function updatePagerUi() {
         const tp = totalPages();
+        const activeRows = getActiveRows();
         if (currentPage < 1) currentPage = 1;
         if (currentPage > tp) currentPage = tp;
         rowCountEl.textContent = String(allRows.length || 0);
+        filteredCountEl.textContent = String(activeRows.length || 0);
         pageInfoEl.textContent = `${currentPage} / ${tp}`;
-        prevPageBtn.disabled = currentPage <= 1 || allRows.length === 0;
-        nextPageBtn.disabled = currentPage >= tp || allRows.length === 0;
+        prevPageBtn.disabled = currentPage <= 1 || activeRows.length === 0;
+        nextPageBtn.disabled = currentPage >= tp || activeRows.length === 0;
       }
 
       function renderCurrentPage() {
         updatePagerUi();
+        const activeRows = getActiveRows();
         const size = Number(pageSizeEl.value || 25);
         const start = (currentPage - 1) * size;
         const end = start + size;
-        renderRows(allRows.slice(start, end));
+        renderRows(activeRows.slice(start, end));
+      }
+
+      function normalizeSearchValue(value) {
+        return String(value || "").toLowerCase().trim();
+      }
+
+      function applyResultSearch() {
+        const query = normalizeSearchValue(resultSearchEl.value);
+        if (!query) {
+          filteredRows = [...allRows];
+        } else {
+          filteredRows = allRows.filter((row) => {
+            const haystack = [
+              row.venue,
+              row.event_name,
+              row.event_date,
+              row.parking_url,
+            ]
+              .map(normalizeSearchValue)
+              .join(" ");
+            return haystack.includes(query);
+          });
+        }
+        currentPage = 1;
+        renderCurrentPage();
       }
 
       function escapeHtml(str) {
@@ -548,7 +602,8 @@
           const data = await resp.json();
           if (!data || data.success !== true) {
             setStatus(`<span class="bad">Error:</span> ${escapeHtml((data && data.error) || "Request failed")}`);
-            renderRows([]);
+            allRows = [];
+            applyResultSearch();
             return;
           }
 
@@ -573,13 +628,11 @@
           setStatus(msg);
           resultMeta.textContent = jsonOutput ? `export: ${jsonOutput}` : "";
           allRows = Array.isArray(data.data) ? data.data : [];
-          currentPage = 1;
-          renderCurrentPage();
+          applyResultSearch();
         } catch (e) {
           setStatus(`<span class="bad">Error:</span> ${escapeHtml(String(e))}`);
           allRows = [];
-          currentPage = 1;
-          renderCurrentPage();
+          applyResultSearch();
         } finally {
           setLoading(false);
         }
@@ -600,8 +653,8 @@
         resultMeta.textContent = "";
         downloadBtn.disabled = true;
         allRows = [];
-        currentPage = 1;
-        renderCurrentPage();
+        resultSearchEl.value = "";
+        applyResultSearch();
       });
 
       downloadBtn.addEventListener("click", () => {
@@ -612,6 +665,7 @@
         currentPage = 1;
         renderCurrentPage();
       });
+      resultSearchEl.addEventListener("input", applyResultSearch);
       prevPageBtn.addEventListener("click", () => {
         currentPage = Math.max(1, currentPage - 1);
         renderCurrentPage();
@@ -622,6 +676,7 @@
       });
 
       // Initialize pager state on load.
+      filteredRows = [...allRows];
       renderCurrentPage();
     </script>
   </body>

@@ -1,0 +1,660 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Client Search</title>
+    <style>
+      :root {
+        --bg: #0a1220;
+        --panel: #111b2d;
+        --panel-2: #16233b;
+        --text: #edf3ff;
+        --muted: #9fb0d0;
+        --border: rgba(255, 255, 255, 0.1);
+        --accent: #78a7ff;
+        --ok: #55c46a;
+        --warn: #f0b74a;
+        --bad: #ef6b6b;
+        --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f5f7fc;
+          --panel: #ffffff;
+          --panel-2: #f3f6fc;
+          --text: #11203b;
+          --muted: #5c6e8f;
+          --border: rgba(15, 27, 54, 0.1);
+          --accent: #245cf0;
+          --shadow: 0 24px 60px rgba(27, 45, 94, 0.08);
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        background:
+          radial-gradient(circle at top left, rgba(120, 167, 255, 0.16), transparent 28%),
+          radial-gradient(circle at top right, rgba(85, 196, 106, 0.12), transparent 20%),
+          var(--bg);
+        color: var(--text);
+      }
+      .shell {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 24px 16px 48px;
+      }
+      .hero {
+        padding: 18px 0 16px;
+      }
+      .eyebrow {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--muted);
+        margin-bottom: 8px;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(30px, 5vw, 48px);
+        line-height: 0.98;
+        letter-spacing: -0.03em;
+      }
+      .sub {
+        max-width: 760px;
+        margin-top: 12px;
+        font-size: 15px;
+        line-height: 1.6;
+        color: var(--muted);
+      }
+      .searchPanel {
+        margin-top: 18px;
+        position: relative;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 22px;
+        padding: 18px;
+        box-shadow: var(--shadow);
+      }
+      .searchRow {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 12px;
+        align-items: center;
+      }
+      @media (max-width: 720px) {
+        .searchRow {
+          grid-template-columns: 1fr;
+        }
+      }
+      .searchInput {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 16px 18px;
+        font: inherit;
+        font-size: 18px;
+        color: var(--text);
+        background: var(--panel-2);
+        outline: none;
+      }
+      .searchInput::placeholder {
+        color: var(--muted);
+      }
+      .metaPills {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        padding: 10px 12px;
+        font-size: 12px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      .suggestions {
+        margin-top: 12px;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        overflow: hidden;
+        display: none;
+      }
+      .suggestions.open {
+        display: block;
+      }
+      .suggestion {
+        width: 100%;
+        border: 0;
+        border-bottom: 1px solid var(--border);
+        background: transparent;
+        color: var(--text);
+        text-align: left;
+        padding: 14px 16px;
+        cursor: pointer;
+      }
+      .suggestion:last-child {
+        border-bottom: 0;
+      }
+      .suggestion:hover,
+      .suggestion.active {
+        background: rgba(120, 167, 255, 0.12);
+      }
+      .suggestionTitle {
+        display: block;
+        font-size: 16px;
+      }
+      .suggestionMeta {
+        margin-top: 4px;
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .status {
+        min-height: 22px;
+        margin-top: 12px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .statusRow {
+        margin-top: 12px;
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+      }
+      .timer {
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .timer strong {
+        color: var(--text);
+      }
+      .status .ok {
+        color: var(--ok);
+      }
+      .status .warn {
+        color: var(--warn);
+      }
+      .status .bad {
+        color: var(--bad);
+      }
+      .results {
+        margin-top: 18px;
+        display: grid;
+        gap: 16px;
+      }
+      .empty {
+        padding: 28px;
+        border: 1px dashed var(--border);
+        border-radius: 22px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .eventCard {
+        display: grid;
+        grid-template-columns: 96px 1fr;
+        gap: 16px;
+        padding: 18px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 22px;
+        box-shadow: var(--shadow);
+      }
+      @media (max-width: 820px) {
+        .eventCard {
+          grid-template-columns: 1fr;
+        }
+      }
+      .dateBadge {
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        padding: 14px 10px;
+        text-align: center;
+        align-self: start;
+      }
+      .dateMonth,
+      .dateDay,
+      .dateDow {
+        display: block;
+      }
+      .dateMonth {
+        font-size: 15px;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+      .dateDay {
+        font-size: 34px;
+        line-height: 1;
+        margin: 6px 0;
+      }
+      .dateDow {
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .eventHeader {
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .eventTitle {
+        margin: 0;
+        font-size: 24px;
+        line-height: 1.1;
+      }
+      .eventMeta {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.6;
+      }
+      .eventLink {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      .countPill {
+        white-space: nowrap;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        padding: 10px 12px;
+        color: var(--muted);
+        font-size: 12px;
+        background: var(--panel-2);
+      }
+      .listingGrid {
+        margin-top: 16px;
+        display: grid;
+        gap: 12px;
+      }
+      .listingCard {
+        border-radius: 18px;
+        border: 1px solid var(--border);
+        padding: 14px;
+        background: rgba(255, 255, 255, 0.02);
+      }
+      .listingTop {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .listingName {
+        margin: 0;
+        font-size: 17px;
+        line-height: 1.3;
+      }
+      .listingPrice {
+        font-size: 22px;
+        line-height: 1;
+        white-space: nowrap;
+      }
+      .listingMeta {
+        margin-top: 8px;
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .tagRow {
+        margin-top: 10px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .tag {
+        display: inline-flex;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font-size: 12px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .loading {
+        opacity: 0.7;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="hero">
+        <div class="eyebrow">StubHub Client Search</div>
+        <h1>Search artists, teams, events, and pull parking listings.</h1>
+        <div class="sub">
+          Start typing. The page shows live StubHub suggestions. Select one result and it will load matching parking
+          events, then scrape the parking listings under each event.
+        </div>
+      </div>
+
+      <div class="searchPanel">
+        <div class="searchRow">
+          <input
+            id="searchInput"
+            class="searchInput"
+            type="text"
+            placeholder="Search J. Cole, Charlotte Hornets, WWE, Lakers, and more"
+            autocomplete="off"
+          />
+          <div class="metaPills">
+            <span class="pill">Page: <span class="mono">/ticketing/ui/client-search</span></span>
+            <span class="pill">Source: <span class="mono">StubHub live search</span></span>
+          </div>
+        </div>
+        <div id="suggestions" class="suggestions"></div>
+        <div class="statusRow">
+          <div id="status" class="status"></div>
+          <div id="timer" class="timer"></div>
+        </div>
+      </div>
+
+      <div id="results" class="results">
+        <div class="empty">
+          Type in the search bar to get StubHub suggestions. Click one suggestion to load parking events and listing
+          details.
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const el = (id) => document.getElementById(id);
+
+      const searchInput = el("searchInput");
+      const suggestionsEl = el("suggestions");
+      const statusEl = el("status");
+      const timerEl = el("timer");
+      const resultsEl = el("results");
+
+      let suggestions = [];
+      let activeIndex = -1;
+      let debounceTimer = null;
+      let running = false;
+      let runStartedAt = null;
+      let runTimer = null;
+
+      function escapeHtml(str) {
+        return String(str || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function setStatus(html) {
+        statusEl.innerHTML = html || "";
+      }
+
+      function formatElapsed(ms) {
+        const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        return `${minutes}:${String(seconds).padStart(2, "0")}`;
+      }
+
+      function stopRunTimer() {
+        if (runTimer) {
+          clearInterval(runTimer);
+          runTimer = null;
+        }
+        runStartedAt = null;
+        timerEl.innerHTML = "";
+      }
+
+      function startRunTimer() {
+        stopRunTimer();
+        runStartedAt = Date.now();
+        timerEl.innerHTML = `<strong>Elapsed:</strong> 0:00`;
+        runTimer = setInterval(() => {
+          timerEl.innerHTML = `<strong>Elapsed:</strong> ${formatElapsed(Date.now() - runStartedAt)}`;
+        }, 1000);
+      }
+
+      function setLoading(value) {
+        running = value;
+        searchInput.classList.toggle("loading", value);
+        if (!value && runStartedAt) {
+          timerEl.innerHTML = `<strong>Total time:</strong> ${formatElapsed(Date.now() - runStartedAt)}`;
+          if (runTimer) {
+            clearInterval(runTimer);
+            runTimer = null;
+          }
+        }
+      }
+
+      function showSuggestions() {
+        suggestionsEl.classList.toggle("open", suggestions.length > 0);
+      }
+
+      function renderSuggestions() {
+        if (!suggestions.length) {
+          suggestionsEl.innerHTML = "";
+          showSuggestions();
+          return;
+        }
+        suggestionsEl.innerHTML = suggestions
+          .map((item, index) => {
+            const meta = [item.subtitle, item.location, item.date && item.time ? `${item.date} ${item.time}` : item.date]
+              .filter(Boolean)
+              .join(" • ");
+            return `
+              <button class="suggestion ${index === activeIndex ? "active" : ""}" data-index="${index}" type="button">
+                <span class="suggestionTitle">${escapeHtml(item.title)}</span>
+                <span class="suggestionMeta">${escapeHtml(meta)}</span>
+              </button>
+            `;
+          })
+          .join("");
+
+        suggestionsEl.querySelectorAll(".suggestion").forEach((button) => {
+          button.addEventListener("click", () => {
+            const index = Number(button.getAttribute("data-index"));
+            const selected = suggestions[index];
+            if (selected) {
+              searchInput.value = selected.title;
+              suggestions = [];
+              activeIndex = -1;
+              renderSuggestions();
+              runSelection(selected);
+            }
+          });
+        });
+        showSuggestions();
+      }
+
+      function monthDayParts(value) {
+        const parts = String(value || "").trim().split(/\s+/);
+        return {
+          month: parts[0] || "",
+          day: parts[1] || "",
+        };
+      }
+
+      function renderResults(cards) {
+        if (!cards || cards.length === 0) {
+          resultsEl.innerHTML = `
+            <div class="empty">
+              No parking events were found for this selection.
+            </div>
+          `;
+          return;
+        }
+
+        resultsEl.innerHTML = cards
+          .map((card) => {
+            const date = monthDayParts(card.formatted_date);
+            const listings = (card.listings || [])
+              .map((listing) => {
+                const tags = [listing.availability, listing.rating].filter(Boolean);
+                return `
+                  <div class="listingCard">
+                    <div class="listingTop">
+                      <h3 class="listingName">${escapeHtml(listing.lot_name)}</h3>
+                      <div class="listingPrice">${escapeHtml(listing.price_display || "")}</div>
+                    </div>
+                    <div class="listingMeta">
+                      ${listing.notes ? `<div>${escapeHtml(listing.notes)}</div>` : ""}
+                      ${listing.availability ? `<div>${escapeHtml(listing.availability)}</div>` : ""}
+                    </div>
+                    ${tags.length ? `<div class="tagRow">${tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
+                  </div>
+                `;
+              })
+              .join("");
+
+            return `
+              <section class="eventCard">
+                <div class="dateBadge">
+                  <span class="dateMonth">${escapeHtml(date.month)}</span>
+                  <span class="dateDay">${escapeHtml(date.day)}</span>
+                  <span class="dateDow">${escapeHtml(card.day_of_week || "")}</span>
+                </div>
+                <div>
+                  <div class="eventHeader">
+                    <div>
+                      <h2 class="eventTitle">${escapeHtml(card.event_name)}</h2>
+                      <div class="eventMeta">
+                        <div>${escapeHtml(card.formatted_time || "")}${card.location ? ` • ${escapeHtml(card.location)}` : ""}</div>
+                        <div>${escapeHtml(card.venue_name || "")}</div>
+                        <div><a class="eventLink" href="${escapeHtml(card.parking_url)}" target="_blank" rel="noreferrer">Open parking event on StubHub</a></div>
+                      </div>
+                    </div>
+                    <div class="countPill">${escapeHtml(String(card.listing_count || 0))} listings</div>
+                  </div>
+                  <div class="listingGrid">${listings}</div>
+                </div>
+              </section>
+            `;
+          })
+          .join("");
+      }
+
+      async function fetchSuggestions(query) {
+        const trimmed = String(query || "").trim();
+        if (trimmed.length < 2) {
+          suggestions = [];
+          activeIndex = -1;
+          renderSuggestions();
+          return;
+        }
+
+        try {
+          const resp = await fetch(`/ticketing/ui/client-search/suggest?q=${encodeURIComponent(trimmed)}`);
+          const data = await resp.json();
+          if (!data || data.success !== true) {
+            throw new Error((data && data.error) || "Suggestion request failed");
+          }
+          suggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+          activeIndex = suggestions.length ? 0 : -1;
+          renderSuggestions();
+        } catch (error) {
+          suggestions = [];
+          activeIndex = -1;
+          renderSuggestions();
+          setStatus(`<span class="bad">Error:</span> ${escapeHtml(String(error))}`);
+        }
+      }
+
+      async function runSelection(selection) {
+        setLoading(true);
+        startRunTimer();
+        setStatus(`<span class="warn">Loading parking events and listings...</span>`);
+        resultsEl.innerHTML = `
+          <div class="empty">
+            Looking up parking events for <strong>${escapeHtml(selection.title || selection.query || "")}</strong>. This can take a bit because the page is scraping live listing data.
+          </div>
+        `;
+
+        try {
+          const resp = await fetch("/ticketing/ui/client-search/run", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(selection),
+          });
+          const data = await resp.json();
+          if (!data || data.success !== true) {
+            throw new Error((data && data.error) || "Run request failed");
+          }
+
+          const found = Number(data.parking_events_found || 0);
+          const scraped = Number(data.parking_events_scraped || 0);
+          setStatus(
+            `<span class="ok">Loaded.</span> Query <span class="mono">${escapeHtml(data.parking_query || "")}</span> matched <strong>${found}</strong> parking events and scraped <strong>${scraped}</strong>.`
+          );
+          renderResults(Array.isArray(data.data) ? data.data : []);
+        } catch (error) {
+          setStatus(`<span class="bad">Error:</span> ${escapeHtml(String(error))}`);
+          resultsEl.innerHTML = `<div class="empty">The parking search failed. Try a different suggestion.</div>`;
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      searchInput.addEventListener("input", () => {
+        const query = searchInput.value;
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          fetchSuggestions(query);
+        }, 250);
+      });
+
+      searchInput.addEventListener("keydown", (event) => {
+        if (!suggestions.length) {
+          if (event.key === "Enter" && searchInput.value.trim()) {
+            event.preventDefault();
+            runSelection({ query: searchInput.value.trim(), title: searchInput.value.trim(), source: "manual" });
+          }
+          return;
+        }
+
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          activeIndex = (activeIndex + 1) % suggestions.length;
+          renderSuggestions();
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          activeIndex = (activeIndex - 1 + suggestions.length) % suggestions.length;
+          renderSuggestions();
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          const chosen = suggestions[Math.max(0, activeIndex)] || suggestions[0];
+          if (chosen) {
+            searchInput.value = chosen.title;
+            suggestions = [];
+            activeIndex = -1;
+            renderSuggestions();
+            runSelection(chosen);
+          }
+        } else if (event.key === "Escape") {
+          suggestions = [];
+          activeIndex = -1;
+          renderSuggestions();
+        }
+      });
+
+      document.addEventListener("click", (event) => {
+        if (!suggestionsEl.contains(event.target) && event.target !== searchInput) {
+          suggestions = [];
+          activeIndex = -1;
+          renderSuggestions();
+        }
+      });
+    </script>
+  </body>
+</html>

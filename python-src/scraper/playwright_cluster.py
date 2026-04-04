@@ -61,9 +61,19 @@ class PlaywrightClusterManager:
         """Execute `task(page)` in a new browser page and return the result."""
         if self._browser is None:
             await self._start()
+        from config import CONFIG
 
         logger.info("[Playwright] Creating new browser context...")
-        context = await self._browser.new_context()
+        context = await self._browser.new_context(
+            locale="en-US",
+            timezone_id="America/New_York",
+            geolocation={"latitude": 40.7128, "longitude": -74.0060},
+            permissions=["geolocation"],
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": CONFIG["app"]["default_user_agent"],
+            },
+        )
         logger.info("[Playwright] Creating new page...")
         page = await context.new_page()
         logger.info(f"[Playwright] Page created. Executing task {task.__name__ if hasattr(task, '__name__') else 'anonymous'}...")

@@ -26,6 +26,75 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
     _debug_dir: Path | None = None
 
     @staticmethod
+    def _is_generic_lot_name(value: str | None) -> bool:
+        text = (value or "").strip()
+        if not text:
+            return True
+        return bool(re.fullmatch(r"(Section\s+\d+|Listing\s+\d+)", text, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _details_score(listing: dict) -> int:
+        score = 0
+        if listing.get("lot_name") and not StubHubParkingScraper._is_generic_lot_name(listing.get("lot_name")):
+            score += 4
+        if listing.get("availability"):
+            score += 2
+        details = listing.get("listing_details") if isinstance(listing.get("listing_details"), dict) else {}
+        if details.get("notes"):
+            score += 2
+        if details.get("rating"):
+            score += 1
+        if listing.get("price"):
+            score += 2
+        return score
+
+    @staticmethod
+    def _merge_pass_collections(*collections: list[dict]) -> list[dict]:
+        merged: dict[str, dict] = {}
+        for collection in collections:
+            for row in collection or []:
+                listing_id = row.get("listing_id")
+                key = str(listing_id) if listing_id else f"{row.get('lot_name')}|{row.get('price')}|{row.get('availability')}"
+                existing = merged.get(key)
+                if not existing:
+                    merged[key] = dict(row)
+                    continue
+
+                current = dict(existing)
+                if StubHubParkingScraper._details_score(row) > StubHubParkingScraper._details_score(current):
+                    preferred, fallback = dict(row), current
+                else:
+                    preferred, fallback = current, dict(row)
+
+                if StubHubParkingScraper._is_generic_lot_name(preferred.get("lot_name")) and not StubHubParkingScraper._is_generic_lot_name(fallback.get("lot_name")):
+                    preferred["lot_name"] = fallback.get("lot_name")
+                    preferred["normalized_lot_name"] = fallback.get("normalized_lot_name")
+                if not preferred.get("availability") and fallback.get("availability"):
+                    preferred["availability"] = fallback.get("availability")
+                if not preferred.get("price") and fallback.get("price"):
+                    preferred["price"] = fallback.get("price")
+                if not preferred.get("currency") and fallback.get("currency"):
+                    preferred["currency"] = fallback.get("currency")
+
+                preferred_details = preferred.get("listing_details") if isinstance(preferred.get("listing_details"), dict) else {}
+                fallback_details = fallback.get("listing_details") if isinstance(fallback.get("listing_details"), dict) else {}
+                if fallback_details:
+                    preferred["listing_details"] = {
+                        **fallback_details,
+                        **preferred_details,
+                    }
+
+                source_parts = []
+                for source in [current.get("_source"), row.get("_source")]:
+                    if source and source not in source_parts:
+                        source_parts.append(source)
+                if source_parts:
+                    preferred["_source"] = "+".join(source_parts)
+
+                merged[key] = preferred
+        return list(merged.values())
+
+    @staticmethod
     def _currency_from_text(price_text: str) -> str:
         text = (price_text or "").strip()
         if not text:
@@ -562,7 +631,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "availability": availability,
                     "listing_id": listing_id,
                     "_source": "state",
-                    "details": row.get("listingNotes") or row.get("description"),
+                    "listing_details": {
+                        "title": lot_name,
+                        "price_incl_fees": price_val,
+                        "availability": availability,
+                        "notes": row.get("listingNotes") or row.get("description"),
+                    },
                 }
             )
         return passes
@@ -611,7 +685,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "availability": availability,
                     "listing_id": listing_id,
                     "_source": "payload_json",
-                    "details": row.get("listingNotes") or row.get("description"),
+                    "listing_details": {
+                        "title": lot_name,
+                        "price_incl_fees": price_val,
+                        "availability": availability,
+                        "notes": row.get("listingNotes") or row.get("description"),
+                    },
                 }
             )
         return passes
@@ -655,6 +734,11 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "availability": availability,
                     "listing_id": listing_id,
                     "_source": source,
+                    "listing_details": {
+                        "title": lot,
+                        "price_incl_fees": formatted,
+                        "availability": availability,
+                    },
                 }
             )
 
@@ -683,6 +767,10 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "currency": currency or None,
                     "availability": None,
                     "_source": source,
+                    "listing_details": {
+                        "title": lot,
+                        "price_incl_fees": price_text,
+                    },
                 }
             )
 
@@ -722,6 +810,11 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "availability": (avail_m.group("avail") if avail_m else None),
                     "listing_id": listing_id,
                     "_source": f"{source}_loose",
+                    "listing_details": {
+                        "title": lot_name,
+                        "price_incl_fees": price_text or (raw_m.group("raw") if raw_m else None),
+                        "availability": (avail_m.group("avail") if avail_m else None),
+                    },
                 }
             )
 
@@ -823,25 +916,18 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             except Exception:
                 pass
 
-            passes = await self._extract_passes_from_dom()
-            if not passes:
-                passes = await self._extract_passes_from_state()
-            if not passes:
-                passes = await self._extract_passes_from_embedded_json()
-            if not passes:
-                merged: list[dict] = []
-                seen: set[str] = set()
-                for payload in captured_payloads + captured_request_payloads:
-                    extracted = self._extract_passes_from_json_payload(payload)
-                    if not extracted:
-                        extracted = self._extract_passes_from_text(payload, source=f"embedded_xhr_{label}")
-                    for p in extracted:
-                        key = p.get("listing_id") or f"{p.get('lot_name')}|{p.get('price')}|{p.get('currency')}|{p.get('availability')}"
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        merged.append(p)
-                passes = merged
+            dom_passes = await self._extract_passes_from_dom()
+            state_passes = await self._extract_passes_from_state()
+            embedded_passes = await self._extract_passes_from_embedded_json()
+
+            xhr_passes: list[dict] = []
+            for payload in captured_payloads + captured_request_payloads:
+                extracted = self._extract_passes_from_json_payload(payload)
+                if not extracted:
+                    extracted = self._extract_passes_from_text(payload, source=f"embedded_xhr_{label}")
+                xhr_passes.extend(extracted)
+
+            passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
 
             probe = {
                 "attempt": label,
@@ -851,6 +937,11 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 "captured_urls": captured_urls[:5],
                 "captured_request_payloads": len(captured_request_payloads),
                 "captured_request_urls": captured_request_urls[:5],
+                "dom_passes": len(dom_passes),
+                "state_passes": len(state_passes),
+                "embedded_passes": len(embedded_passes),
+                "xhr_passes": len(xhr_passes),
+                "merged_passes": len(passes),
             }
             return passes, probe
 
