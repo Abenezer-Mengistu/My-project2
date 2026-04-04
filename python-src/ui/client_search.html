@@ -111,6 +111,14 @@
         flex-wrap: wrap;
         justify-content: flex-end;
       }
+      .actionsRow {
+        margin-top: 14px;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+      }
       .pill {
         display: inline-flex;
         align-items: center;
@@ -121,6 +129,20 @@
         font-size: 12px;
         color: var(--muted);
         background: rgba(255, 255, 255, 0.02);
+      }
+      .button {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 14px;
+        font: inherit;
+        font-size: 14px;
+        color: var(--text);
+        background: var(--panel-2);
+        cursor: pointer;
+      }
+      .button[disabled] {
+        opacity: 0.55;
+        cursor: not-allowed;
       }
       .mono {
         font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -183,6 +205,61 @@
       }
       .timer strong {
         color: var(--text);
+      }
+      .loadingPanel {
+        margin-top: 18px;
+        border: 1px solid var(--border);
+        border-radius: 22px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        padding: 20px;
+      }
+      .loadingTitle {
+        margin: 0 0 8px;
+        font-size: 20px;
+      }
+      .loadingText {
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.6;
+      }
+      .progressBar {
+        margin-top: 14px;
+        height: 12px;
+        border-radius: 999px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border);
+      }
+      .progressBarFill {
+        height: 100%;
+        width: 42%;
+        background: linear-gradient(90deg, var(--accent), #6fd3a3);
+        border-radius: 999px;
+        animation: loadingShift 1.4s ease-in-out infinite;
+        transform-origin: left center;
+      }
+      .loadingSteps {
+        margin-top: 14px;
+        display: grid;
+        gap: 8px;
+      }
+      .loadingStep {
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.02);
+        padding: 10px 12px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .loadingStep.active {
+        color: var(--text);
+        background: rgba(120, 167, 255, 0.1);
+      }
+      .loadingHint {
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 13px;
       }
       .status .ok {
         color: var(--ok);
@@ -330,6 +407,17 @@
       .loading {
         opacity: 0.7;
       }
+      @keyframes loadingShift {
+        0% {
+          transform: translateX(-55%) scaleX(0.85);
+        }
+        50% {
+          transform: translateX(75%) scaleX(1.05);
+        }
+        100% {
+          transform: translateX(-55%) scaleX(0.85);
+        }
+      }
     </style>
   </head>
   <body>
@@ -357,6 +445,9 @@
             <span class="pill">Source: <span class="mono">StubHub live search</span></span>
           </div>
         </div>
+        <div class="actionsRow">
+          <button id="downloadExcelBtn" class="button" type="button" disabled>Download Excel</button>
+        </div>
         <div id="suggestions" class="suggestions"></div>
         <div class="statusRow">
           <div id="status" class="status"></div>
@@ -380,6 +471,7 @@
       const statusEl = el("status");
       const timerEl = el("timer");
       const resultsEl = el("results");
+      const downloadExcelBtn = el("downloadExcelBtn");
 
       let suggestions = [];
       let activeIndex = -1;
@@ -387,6 +479,10 @@
       let running = false;
       let runStartedAt = null;
       let runTimer = null;
+      let currentCards = [];
+      let currentSelection = null;
+      let currentParkingQuery = "";
+      let loadingPhaseIndex = 0;
 
       function escapeHtml(str) {
         return String(str || "")
@@ -399,6 +495,10 @@
 
       function setStatus(html) {
         statusEl.innerHTML = html || "";
+      }
+
+      function setDownloadEnabled(value) {
+        downloadExcelBtn.disabled = !value;
       }
 
       function formatElapsed(ms) {
@@ -436,6 +536,40 @@
             runTimer = null;
           }
         }
+      }
+
+      function loadingMarkup(selectionTitle) {
+        const steps = [
+          "Searching StubHub for matching parking events",
+          "Collecting parking event pages across result pages",
+          "Scraping listings, prices, and lot details",
+          "Grouping results for display and download",
+        ];
+        const activeStep = Math.min(steps.length - 1, loadingPhaseIndex);
+        return `
+          <section class="loadingPanel">
+            <h2 class="loadingTitle">Loading parking events and listings</h2>
+            <div class="loadingText">
+              Looking up parking data for <strong>${escapeHtml(selectionTitle)}</strong>. This request scrapes live StubHub
+              listing pages and may take several minutes for larger events.
+            </div>
+            <div class="progressBar"><div class="progressBarFill"></div></div>
+            <div class="loadingSteps">
+              ${steps
+                .map(
+                  (step, index) => `
+                    <div class="loadingStep ${index <= activeStep ? "active" : ""}">
+                      ${index + 1}. ${escapeHtml(step)}
+                    </div>
+                  `
+                )
+                .join("")}
+            </div>
+            <div class="loadingHint">
+              Elapsed time updates above. Results appear when scraping finishes.
+            </div>
+          </section>
+        `;
       }
 
       function showSuggestions() {
@@ -487,6 +621,9 @@
       }
 
       function renderResults(cards) {
+        currentCards = Array.isArray(cards) ? cards : [];
+        setDownloadEnabled(currentCards.length > 0);
+
         if (!cards || cards.length === 0) {
           resultsEl.innerHTML = `
             <div class="empty">
@@ -545,6 +682,105 @@
           .join("");
       }
 
+      function flattenCards(cards) {
+        const rows = [];
+        (cards || []).forEach((card) => {
+          (card.listings || []).forEach((listing) => {
+            rows.push({
+              event_name: card.event_name || "",
+              formatted_date: card.formatted_date || "",
+              day_of_week: card.day_of_week || "",
+              formatted_time: card.formatted_time || "",
+              venue_name: card.venue_name || "",
+              location: card.location || "",
+              parking_url: card.parking_url || "",
+              lot_name: listing.lot_name || "",
+              availability: listing.availability || "",
+              price_display: listing.price_display || "",
+              rating: listing.rating || "",
+              notes: listing.notes || "",
+              listing_id: listing.listing_id || "",
+            });
+          });
+        });
+        return rows;
+      }
+
+      function excelCell(value) {
+        return `<td>${escapeHtml(String(value || ""))}</td>`;
+      }
+
+      function downloadExcel() {
+        const rows = flattenCards(currentCards);
+        if (!rows.length) {
+          return;
+        }
+
+        const title = (currentSelection && (currentSelection.title || currentSelection.query)) || "parking-results";
+        const safeTitle = String(title)
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "") || "parking-results";
+
+        const html = `
+          <html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">
+            <head>
+              <meta charset="utf-8" />
+            </head>
+            <body>
+              <table border="1">
+                <tr>
+                  <th>Event Name</th>
+                  <th>Date</th>
+                  <th>Day</th>
+                  <th>Time</th>
+                  <th>Venue</th>
+                  <th>Location</th>
+                  <th>Parking URL</th>
+                  <th>Lot Name</th>
+                  <th>Availability</th>
+                  <th>Price</th>
+                  <th>Rating</th>
+                  <th>Notes</th>
+                  <th>Listing ID</th>
+                </tr>
+                ${rows
+                  .map(
+                    (row) => `
+                      <tr>
+                        ${excelCell(row.event_name)}
+                        ${excelCell(row.formatted_date)}
+                        ${excelCell(row.day_of_week)}
+                        ${excelCell(row.formatted_time)}
+                        ${excelCell(row.venue_name)}
+                        ${excelCell(row.location)}
+                        ${excelCell(row.parking_url)}
+                        ${excelCell(row.lot_name)}
+                        ${excelCell(row.availability)}
+                        ${excelCell(row.price_display)}
+                        ${excelCell(row.rating)}
+                        ${excelCell(row.notes)}
+                        ${excelCell(row.listing_id)}
+                      </tr>
+                    `
+                  )
+                  .join("")}
+              </table>
+            </body>
+          </html>
+        `;
+
+        const blob = new Blob([html], { type: "application/vnd.ms-excel;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${safeTitle}.xls`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      }
+
       async function fetchSuggestions(query) {
         const trimmed = String(query || "").trim();
         if (trimmed.length < 2) {
@@ -572,14 +808,19 @@
       }
 
       async function runSelection(selection) {
+        currentSelection = selection;
+        currentCards = [];
+        currentParkingQuery = "";
+        setDownloadEnabled(false);
+        loadingPhaseIndex = 0;
         setLoading(true);
         startRunTimer();
         setStatus(`<span class="warn">Loading parking events and listings...</span>`);
-        resultsEl.innerHTML = `
-          <div class="empty">
-            Looking up parking events for <strong>${escapeHtml(selection.title || selection.query || "")}</strong>. This can take a bit because the page is scraping live listing data.
-          </div>
-        `;
+        resultsEl.innerHTML = loadingMarkup(selection.title || selection.query || "");
+        const phaseTimer = setInterval(() => {
+          loadingPhaseIndex = Math.min(3, loadingPhaseIndex + 1);
+          resultsEl.innerHTML = loadingMarkup(selection.title || selection.query || "");
+        }, 18000);
 
         try {
           const resp = await fetch("/ticketing/ui/client-search/run", {
@@ -594,6 +835,7 @@
 
           const found = Number(data.parking_events_found || 0);
           const scraped = Number(data.parking_events_scraped || 0);
+          currentParkingQuery = data.parking_query || "";
           setStatus(
             `<span class="ok">Loaded.</span> Query <span class="mono">${escapeHtml(data.parking_query || "")}</span> matched <strong>${found}</strong> parking events and scraped <strong>${scraped}</strong>.`
           );
@@ -602,9 +844,12 @@
           setStatus(`<span class="bad">Error:</span> ${escapeHtml(String(error))}`);
           resultsEl.innerHTML = `<div class="empty">The parking search failed. Try a different suggestion.</div>`;
         } finally {
+          clearInterval(phaseTimer);
           setLoading(false);
         }
       }
+
+      downloadExcelBtn.addEventListener("click", downloadExcel);
 
       searchInput.addEventListener("input", () => {
         const query = searchInput.value;
