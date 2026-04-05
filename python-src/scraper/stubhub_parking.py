@@ -26,6 +26,33 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
     _debug_dir: Path | None = None
 
     @staticmethod
+    def _listing_identifier(row: dict) -> str | None:
+        for key in ["listing_id", "inventory_id", "listing_key", "id"]:
+            value = row.get(key)
+            if value not in (None, ""):
+                return str(value)
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        for key in ["listingId", "inventoryId", "listingKey", "id"]:
+            value = details.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _listing_fallback_identity(row: dict) -> str:
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        parts = [
+            row.get("normalized_lot_name") or row.get("lot_name") or "",
+            row.get("price") or "",
+            row.get("availability") or "",
+            details.get("price_incl_fees") or "",
+            details.get("notes") or "",
+            details.get("title") or "",
+            row.get("_source") or "",
+        ]
+        return "|".join(str(part).strip() for part in parts)
+
+    @staticmethod
     def _is_generic_lot_name(value: str | None) -> bool:
         text = (value or "").strip()
         if not text:
@@ -53,8 +80,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         merged: dict[str, dict] = {}
         for collection in collections:
             for row in collection or []:
-                listing_id = row.get("listing_id")
-                key = str(listing_id) if listing_id else f"{row.get('lot_name')}|{row.get('price')}|{row.get('availability')}"
+                listing_id = StubHubParkingScraper._listing_identifier(row)
+                key = f"id:{listing_id}" if listing_id else f"fallback:{StubHubParkingScraper._listing_fallback_identity(row)}"
                 existing = merged.get(key)
                 if not existing:
                     merged[key] = dict(row)
@@ -93,6 +120,29 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
                 merged[key] = preferred
         return list(merged.values())
+
+    @staticmethod
+    def _filter_telemetry_rows(rows: list[dict]) -> list[dict]:
+        if not rows:
+            return rows
+
+        real_rows = [
+            row for row in rows
+            if not StubHubParkingScraper._is_generic_lot_name(row.get("lot_name"))
+            and (row.get("availability") or (row.get("listing_details") or {}).get("availability"))
+        ]
+        if not real_rows:
+            return rows
+
+        filtered = []
+        for row in rows:
+            details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+            if StubHubParkingScraper._is_generic_lot_name(row.get("lot_name")):
+                continue
+            if not row.get("availability") and not details.get("availability") and "embedded_xhr" in str(row.get("_source") or "").lower():
+                continue
+            filtered.append(row)
+        return filtered or real_rows
 
     @staticmethod
     def _currency_from_text(price_text: str) -> str:
@@ -319,7 +369,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             if obj_id in seen_obj:
                 continue
             seen_obj.add(obj_id)
-            listing_id = cur.get("listingId") or cur.get("listing_id") or cur.get("id")
+            listing_id = (
+                cur.get("listingId")
+                or cur.get("listing_id")
+                or cur.get("inventoryId")
+                or cur.get("listingKey")
+                or cur.get("id")
+            )
             price = StubHubParkingScraper._price_from_object(cur)
             if listing_id and price:
                 results.append(cur)
@@ -697,7 +753,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         passes: list[dict] = []
         seen: set[str] = set()
         for row in found:
-            listing_id = row.get("listingId") or row.get("listing_id") or row.get("id")
+            listing_id = (
+                row.get("listingId")
+                or row.get("listing_id")
+                or row.get("inventoryId")
+                or row.get("listingKey")
+                or row.get("id")
+            )
             price_val = self._price_from_object(row)
             price = self._numeric_price(str(price_val)) if price_val is not None else None
             if not listing_id or not price:
@@ -729,8 +791,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "currency": None,
                     "availability": availability,
                     "listing_id": listing_id,
+                    "inventory_id": row.get("inventoryId"),
+                    "listing_key": row.get("listingKey"),
                     "_source": "state",
                     "listing_details": {
+                        "listingId": listing_id,
+                        "inventoryId": row.get("inventoryId"),
+                        "listingKey": row.get("listingKey"),
                         "title": lot_name,
                         "price_incl_fees": price_val,
                         "availability": availability,
@@ -751,7 +818,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         passes: list[dict] = []
         seen: set[str] = set()
         for row in found:
-            listing_id = row.get("listingId") or row.get("listing_id") or row.get("id")
+            listing_id = (
+                row.get("listingId")
+                or row.get("listing_id")
+                or row.get("inventoryId")
+                or row.get("listingKey")
+                or row.get("id")
+            )
             price_val = self._price_from_object(row)
             price = self._numeric_price(str(price_val)) if price_val is not None else None
             if not listing_id or not price:
@@ -783,8 +856,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "currency": None,
                     "availability": availability,
                     "listing_id": listing_id,
+                    "inventory_id": row.get("inventoryId"),
+                    "listing_key": row.get("listingKey"),
                     "_source": "payload_json",
                     "listing_details": {
+                        "listingId": listing_id,
+                        "inventoryId": row.get("inventoryId"),
+                        "listingKey": row.get("listingKey"),
                         "title": lot_name,
                         "price_incl_fees": price_val,
                         "availability": availability,
@@ -995,6 +1073,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 xhr_passes.extend(extracted)
 
             passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
+            passes = self._filter_telemetry_rows(passes)
 
             probe = {
                 "attempt": label,
