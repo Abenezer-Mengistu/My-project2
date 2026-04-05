@@ -188,25 +188,54 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
     def _price_from_object(obj: dict) -> str | None:
         if not isinstance(obj, dict):
             return None
-        for key in ["formattedPrice", "price", "listingPrice", "unitPrice"]:
-            if key in obj and obj[key] is not None:
-                return str(obj[key])
+
+        def pick(value) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                for nested_key in [
+                    "formatted",
+                    "display",
+                    "amount",
+                    "value",
+                    "formattedPrice",
+                    "currentPrice",
+                    "discountedPrice",
+                    "rawPrice",
+                ]:
+                    if value.get(nested_key) is not None:
+                        nested_value = value.get(nested_key)
+                        if nested_key == "rawPrice":
+                            normalized = StubHubParkingScraper._normalize_raw_price(nested_value)
+                            if normalized is not None:
+                                return str(normalized)
+                        return str(nested_value)
+                return None
+            return str(value)
+
+        # Prefer the live sale/current price that the site surfaces to users.
+        for key in [
+            "currentPrice",
+            "currentPriceWithFees",
+            "priceWithFees",
+            "discountedPrice",
+            "salePrice",
+            "displayPrice",
+            "priceInfo",
+            "priceDisplay",
+            "formattedPrice",
+            "price",
+            "listingPrice",
+            "unitPrice",
+        ]:
+            picked = pick(obj.get(key))
+            if picked is not None:
+                return picked
+
         if obj.get("rawPrice") is not None:
             normalized = StubHubParkingScraper._normalize_raw_price(obj.get("rawPrice"))
             if normalized is not None:
                 return str(normalized)
-        for key in ["currentPrice", "priceWithFees", "displayPrice", "priceInfo", "priceDisplay"]:
-            nested = obj.get(key)
-            if isinstance(nested, dict):
-                for nk in ["formatted", "display", "amount", "value", "formattedPrice", "rawPrice"]:
-                    if nk in nested and nested[nk] is not None:
-                        return str(nested[nk])
-        for key in ["displayPrice", "priceInfo"]:
-            if isinstance(obj.get(key), dict):
-                nested = obj[key]
-                for nk in ["formatted", "display", "amount", "value"]:
-                    if nk in nested and nested[nk] is not None:
-                        return str(nested[nk])
         return None
 
     async def _count_visible_listing_nodes(self) -> int:
