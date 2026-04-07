@@ -156,9 +156,19 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             return "EUR"
         if "GBP" in upper or "£" in text:
             return "GBP"
-        if "ZAR" in upper or re.search(r"\bR\s?\d", text):
+        if "ZAR" in upper:
             return "ZAR"
         return ""
+
+    @staticmethod
+    def _normalize_price_text_display(price_text: str | None) -> str | None:
+        text = (price_text or "").strip()
+        if not text:
+            return None
+        # StubHub's DOM sometimes emits a bare "R" glyph for USD on US pages.
+        if re.fullmatch(r"R\s?[0-9][0-9,]*(?:\.[0-9]{1,2})?", text):
+            return re.sub(r"^R", "$", text, count=1)
+        return text
 
     @staticmethod
     def _numeric_price(price_text: str) -> str | None:
@@ -413,9 +423,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
     async def _extract_passes_from_dom(self) -> list[dict]:
         async def _extract_from_context(ctx) -> list[dict]:
-            # Updated selectors based on live inspection
             selectors = [
-                'div[role="button"].sc-194s59m-4',  # Common listing card pattern
+                'div[role="button"].sc-194s59m-4',
                 '[data-testid*="listing"]',
                 'div[data-listing-id]',
                 'div.sc-194s59m-4',
@@ -425,7 +434,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             for selector in selectors:
                 try:
                     listings = await ctx.query_selector_all(selector)
-                    if len(listings) > 2: # Prefer selectors that find multiple items
+                    if len(listings) > 2:
                         break
                 except Exception:
                     continue
@@ -441,27 +450,20 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                                 || node.getAttribute('data-listingid')
                                 || node.dataset?.listingId
                                 || null;
-
-                            // Title: h3 is very reliable for lot name
-                            const title = node.querySelector('h3')?.textContent?.trim() 
+                            const title = node.querySelector('h3')?.textContent?.trim()
                                        || node.querySelector('strong')?.textContent?.trim()
                                        || null;
-
-                            // Price: search for currency + digit patterns
                             let priceText = null;
                             const priceNodes = Array.from(node.querySelectorAll('div, span, b, p'));
                             for (const p of priceNodes) {
                                 const t = p.textContent.trim();
-                                if (/^[$€£]\s?[0-9,.]+$/.test(t) || /^[A-Z]{1,3}\s?[0-9,.]+$/.test(t) || /^[0-9,.]+\s?[$€£]/.test(t)) {
-                                    // Verify it's not and availability text
+                                if (/^[$€£R]\s?[0-9,.]+$/.test(t) || /^[A-Z]{1,3}\s?[0-9,.]+$/.test(t) || /^[0-9,.]+\s?[$€£R]/.test(t)) {
                                     if (!t.toLowerCase().includes('pass')) {
                                         priceText = t;
                                         break;
                                     }
                                 }
                             }
-                            
-                            // Specific class fallback for price
                             if (!priceText) {
                                 const pEl = node.querySelector('[class*="sc-1t1b4cp-1"]');
                                 if (pEl) {
@@ -471,20 +473,16 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                                     }
                                 }
                             }
-
-                            // If still no price, try regex on all text nodes but ignore passes
                             if (!priceText) {
                                 for (const p of priceNodes) {
                                     const t = p.textContent.trim();
-                                    const match = t.match(/([$€£]\s?[0-9,.]+|[0-9,.]+\s?[$€£]|[A-Z]{2,3}\s?[0-9,.]+)/);
+                                    const match = t.match(/([$€£R]\s?[0-9,.]+|[0-9,.]+\s?[$€£R]|[A-Z]{2,3}\s?[0-9,.]+)/);
                                     if (match && !t.toLowerCase().includes('pass')) {
                                         priceText = match[0];
                                         break;
                                     }
                                 }
                             }
-
-                            // Availability
                             let rawAvail = null;
                             const availNodes = Array.from(node.querySelectorAll('div, span'));
                             for (const a of availNodes) {
@@ -494,22 +492,10 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                                     break;
                                 }
                             }
-
-                            // Rating & Notes
                             const rating = node.querySelector('[class*="Amazing"], [class*="Great"], [class*="Good"]')?.textContent?.trim() || null;
                             const notes = Array.from(node.querySelectorAll('div')).map(d => d.textContent.trim()).find(t => t.includes('walk') || t.includes('mi from venue')) || null;
-
                             const text = (node.innerText || node.textContent || '').trim();
-
-                            return {
-                                listingId,
-                                title,
-                                priceText,
-                                rawAvail,
-                                rating,
-                                notes,
-                                text
-                            };
+                            return { listingId, title, priceText, rawAvail, rating, notes, text };
                         }"""
                     )
                 except Exception:
@@ -521,29 +507,24 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 listing_id = data.get("listingId")
                 title = data.get("title")
                 text = data.get("text") or ""
-                price_text = data.get("priceText") or ""
+                price_text = self._normalize_price_text_display(data.get("priceText") or "") or ""
 
-                # Robust price extraction
                 price_match = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)", price_text)
                 if not price_match and text:
-                    price_match = re.search(r"[$€£]\s?([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
-                
+                    price_match = re.search(r"[$€£R]\s?([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
                 if not price_match:
                     continue
-                
+
                 price = price_match.group(1).replace(",", "")
                 currency = self._currency_from_text(price_text or text)
-                # Ensure two decimal places for consistency
                 if "." not in price:
                     price = f"{price}.00"
 
                 availability = self._availability_from_text(data.get("rawAvail") or text)
-
                 lot_name = title
                 if not lot_name:
                     first_lines = [l.strip() for l in text.splitlines() if l.strip()]
                     lot_name = first_lines[0][:120] if first_lines else None
-                
                 if not lot_name:
                     continue
 
@@ -586,7 +567,6 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             logger.warning(f"[Scraper] Failed to save debug screenshot: {e}")
 
         await self.human_delay()
-
         passes = await _extract_from_context(self.page)
         logger.info(f"[Scraper] DOM extraction found {len(passes or [])} passes")
         if passes:
@@ -1073,7 +1053,15 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
                 logger.info("[Scraper] Expanding and scrolling listing inventory...")
                 try:
-                    await self._load_all_listing_inventory()
+                    body_text = await self.page.evaluate("""() => document.body.innerText || ''""")
+                    visible_before_expand = await self._count_visible_listing_nodes()
+                    has_listing_count = bool(re.search(r"\b\d+\s+listings\b", body_text, flags=re.IGNORECASE))
+                    if has_listing_count and visible_before_expand >= 20:
+                        logger.info(
+                            f"[Scraper] Detected virtualized listing pane ({visible_before_expand} visible cards); skipping pre-scroll expansion."
+                        )
+                    else:
+                        await self._load_all_listing_inventory()
                 except Exception as exc:
                     logger.warning(f"[Scraper] Inventory expansion failed; continuing with partial page state: {exc}")
 
