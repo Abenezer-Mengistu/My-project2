@@ -43,8 +43,23 @@ def extract_total_price(listing: dict) -> Decimal | None:
     """
     Extract the total price from a parking pass listing dict.
     """
-    for key in ("total", "price", "formattedPrice", "rawPrice"):
-        val = listing.get(key)
+    details = listing.get("listing_details") if isinstance(listing.get("listing_details"), dict) else {}
+
+    # Prefer the live user-facing/sale price before generic list/base price fields.
+    candidate_values = [
+        listing.get("current_price"),
+        details.get("current_price"),
+        details.get("price_incl_fees"),
+        details.get("discounted_price"),
+        listing.get("total"),
+        listing.get("priceWithFees"),
+        listing.get("currentPrice"),
+        listing.get("formattedPrice"),
+        listing.get("price"),
+        listing.get("rawPrice"),
+    ]
+
+    for val in candidate_values:
         price = extract_numeric_price(val)
         if price is not None:
             return price
@@ -68,7 +83,8 @@ def currency_from_listing(listing: dict) -> str:
     raw_currency = listing.get("currency")
     if raw_currency and len(raw_currency) == 3:
         return raw_currency.upper()
-    price_str = listing.get("price_incl_fees") or listing.get("price") or ""
+    details = listing.get("listing_details") if isinstance(listing.get("listing_details"), dict) else {}
+    price_str = details.get("price_incl_fees") or listing.get("price_incl_fees") or listing.get("price") or ""
     if isinstance(price_str, str):
         for symbol, code in CURRENCY_MAP.items():
             if symbol in price_str:

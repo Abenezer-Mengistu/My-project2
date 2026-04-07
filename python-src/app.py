@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import re
-from urllib.parse import unquote, urlsplit, urlparse, parse_qs, urlencode, urlunparse, urljoin
+from urllib.parse import unquote, urlsplit, urlparse, parse_qs, parse_qsl, urlencode, urlunparse, urlunsplit, urljoin
 import httpx
 
 from fastapi import FastAPI, Request
@@ -343,6 +343,41 @@ async def _fetch_stubhub_search_index(query: str, page: int = 0) -> dict:
         raise ValueError("Failed to parse StubHub search results.") from exc
 
 
+async def _fetch_stubhub_index_from_url(url: str, page: int = 0) -> dict:
+    target_url = _normalize_stubhub_url(url)
+    if not target_url:
+        raise ValueError("valid StubHub url is required")
+
+    parts = urlsplit(target_url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if page > 0:
+        params["page"] = str(page)
+    elif "page" in params:
+        params.pop("page", None)
+    request_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
+
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=30.0,
+        headers=_stubhub_browser_headers(),
+    ) as client:
+        response = await client.get(request_url)
+        response.raise_for_status()
+
+    match = re.search(
+        r'<script id="index-data" type="application/json">(.*?)</script>',
+        response.text,
+        re.DOTALL,
+    )
+    if not match:
+        raise ValueError("StubHub page did not include index-data JSON.")
+
+    try:
+        return json.loads(html.unescape(match.group(1)))
+    except Exception as exc:
+        raise ValueError("Failed to parse StubHub page index-data.") from exc
+
+
 def _stubhub_search_grid_items(index_data: dict) -> list[dict]:
     grids = index_data.get("eventGrids") or {}
     items: list[dict] = []
@@ -353,6 +388,33 @@ def _stubhub_search_grid_items(index_data: dict) -> list[dict]:
                 if isinstance(raw_items, list):
                     items.extend([item for item in raw_items if isinstance(item, dict)])
     return items
+
+
+def _stubhub_item_to_selection(item: dict, source: str) -> dict:
+    raw_url = item.get("url")
+    absolute_url = _normalize_stubhub_url(urljoin("https://www.stubhub.com", raw_url or ""))
+    canonical_url = _canonical_stubhub_url(absolute_url)
+    return {
+        "title": item.get("title") or item.get("name") or "",
+        "subtitle": item.get("subtitle") or "",
+        "name": item.get("name") or item.get("title") or "",
+        "url": absolute_url,
+        "canonical_url": canonical_url,
+        "source": source,
+        "selection_type": _stubhub_selection_type(canonical_url),
+        "location": item.get("formattedVenueLocation") or "",
+        "venue_name": item.get("venueName") or "",
+        "venueName": item.get("venueName") or "",
+        "date": item.get("formattedDate") or "",
+        "time": item.get("formattedTime") or "",
+        "dayOfWeek": item.get("dayOfWeek") or "",
+        "formattedDate": item.get("formattedDate") or "",
+        "formattedTime": item.get("formattedTime") or "",
+        "formattedVenueLocation": item.get("formattedVenueLocation") or "",
+        "eventMetadata": item.get("eventMetadata") or {},
+        "is_parking_event": bool(item.get("isParkingEvent")),
+        "relationship_count": item.get("numberRelationships"),
+    }
 
 
 async def _fetch_stubhub_search_grid_items_paginated(query: str, max_pages: int = 5) -> list[dict]:
@@ -379,6 +441,297 @@ async def _fetch_stubhub_search_grid_items_paginated(query: str, max_pages: int 
             break
 
     return combined
+
+
+async def _fetch_stubhub_schedule_items(selection_url: str, max_pages: int = 6) -> list[dict]:
+    seen: set[str] = set()
+    combined: list[dict] = []
+
+    for page in range(max(1, max_pages)):
+        try:
+            index_data = await _fetch_stubhub_index_from_url(selection_url, page=page)
+        except Exception:
+            break
+        page_items = _stubhub_search_grid_items(index_data)
+        if not page_items:
+            break
+
+        new_count = 0
+        for item in page_items:
+            selection = _stubhub_item_to_selection(item, source="event")
+            canonical = selection.get("canonical_url")
+            if not canonical or selection.get("is_parking_event"):
+                continue
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            combined.append(selection)
+            new_count += 1
+
+        if new_count == 0 or len(page_items) < 20:
+            break
+
+    if combined:
+        return combined
+    return await _fetch_stubhub_schedule_items_via_playwright(selection_url)
+
+
+def _formatted_date_from_iso(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = date.fromisoformat(value)
+    except Exception:
+        return value or ""
+    return parsed.strftime("%b %d")
+
+
+async def _fetch_stubhub_schedule_items_via_playwright(selection_url: str, max_scrolls: int = 18) -> list[dict]:
+    async def _task(page):
+        await page.goto(selection_url, wait_until="commit", timeout=60000)
+        await asyncio.sleep(2)
+        stable_rounds = 0
+        last_count = -1
+        for _ in range(max_scrolls):
+            try:
+                await page.evaluate(
+                    """() => {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        const containers = Array.from(document.querySelectorAll('div, section, main'))
+                          .filter((el) => el.scrollHeight > (el.clientHeight + 40))
+                          .slice(0, 10);
+                        for (const el of containers) {
+                          try { el.scrollTop = el.scrollHeight; } catch (e) {}
+                        }
+                    }"""
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            try:
+                current_count = await page.locator("a[href*='/event/']").count()
+            except Exception:
+                current_count = 0
+            if current_count <= last_count:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+            last_count = max(last_count, current_count)
+            if stable_rounds >= 4:
+                break
+
+        return await page.evaluate(
+            """() => Array.from(document.querySelectorAll("a[href*='/event/']")).map((a) => {
+                const href = a.href || a.getAttribute('href') || '';
+                const text = (a.innerText || a.textContent || '').trim();
+                const container = a.closest('article, li, section, div');
+                const context = (container?.innerText || '').trim();
+                return { href, text, context };
+            })"""
+        )
+
+    cluster = await PlaywrightClusterManager.get_or_create(None)
+    raw_items = await cluster.execute(_task)
+    if not isinstance(raw_items, list):
+        return []
+
+    results: list[dict] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        canonical = _canonical_stubhub_url(item.get("href"))
+        if not canonical or canonical in seen or "/event/" not in canonical:
+            continue
+        seen.add(canonical)
+        results.append(
+            {
+                "title": _derive_event_name_from_url(canonical),
+                "name": _derive_event_name_from_url(canonical),
+                "url": canonical,
+                "canonical_url": canonical,
+                "source": "event",
+                "selection_type": "event",
+                "location": "",
+                "venue_name": "",
+                "venueName": "",
+                "date": _formatted_date_from_iso(_derive_event_date_from_url(canonical)),
+                "time": "",
+                "dayOfWeek": "",
+                "formattedDate": _formatted_date_from_iso(_derive_event_date_from_url(canonical)),
+                "formattedTime": "",
+                "formattedVenueLocation": "",
+                "eventMetadata": {},
+                "is_parking_event": False,
+                "relationship_count": None,
+            }
+        )
+
+    results.sort(key=lambda item: (item.get("formattedDate") or "", item.get("title") or ""))
+    return results
+
+
+def _normalized_date_key(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"([A-Za-z]{3})\s+0?(\d{1,2})", text)
+    if not m:
+        return re.sub(r"\s+", " ", text).lower()
+    return f"{m.group(1).lower()}-{int(m.group(2))}"
+
+
+def _normalized_location_key(value: str | None) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    city = text.split(",", 1)[0]
+    return re.sub(r"[^a-z0-9]+", "", city)
+
+
+def _parking_candidate_score(candidate: dict, event_item: dict) -> int:
+    score = 0
+    if _normalized_date_key(candidate.get("formattedDate")) == _normalized_date_key(event_item.get("formattedDate") or event_item.get("date")):
+        score += 5
+    if _normalized_location_key(candidate.get("formattedVenueLocation")) == _normalized_location_key(event_item.get("formattedVenueLocation") or event_item.get("location")):
+        score += 4
+
+    candidate_venue = re.sub(r"[^a-z0-9]+", "", str(candidate.get("venueName") or "").lower())
+    event_venue = re.sub(r"[^a-z0-9]+", "", str(event_item.get("venueName") or event_item.get("venue_name") or "").lower())
+    if candidate_venue and event_venue and candidate_venue == event_venue:
+        score += 4
+
+    candidate_title = str(candidate.get("title") or candidate.get("name") or "").lower()
+    event_title = str(event_item.get("title") or event_item.get("name") or "").lower()
+    for token in [t for t in re.split(r"[^a-z0-9]+", event_title) if len(t) > 2]:
+        if token in candidate_title:
+            score += 1
+    if "parking passes only" in candidate_title:
+        score += 2
+    return score
+
+
+async def _resolve_parking_candidate_for_event(event_item: dict) -> dict | None:
+    query = _build_parking_query_from_selection(
+        {
+            "title": event_item.get("title") or event_item.get("name") or "",
+            "location": event_item.get("formattedVenueLocation") or event_item.get("location") or "",
+            "venue_name": event_item.get("venueName") or event_item.get("venue_name") or "",
+            "source": "event",
+        }
+    )
+    search_items = await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
+    parking_candidates = []
+    for item in search_items:
+        if not item.get("isParkingEvent"):
+            continue
+        selection = _stubhub_item_to_selection(item, source="event")
+        if selection.get("canonical_url"):
+            parking_candidates.append(selection)
+
+    if not parking_candidates:
+        return None
+
+    parking_candidates.sort(key=lambda item: _parking_candidate_score(item, event_item), reverse=True)
+    best = parking_candidates[0]
+    return best if _parking_candidate_score(best, event_item) > 0 else None
+
+
+async def _fetch_expanded_schedule_items_from_queries(title: str, max_events: int = 120) -> list[dict]:
+    clean_title = (title or "").strip()
+    if not clean_title:
+        return []
+
+    month_tokens = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    query_years = [date.today().year, date.today().year + 1]
+    queries = [clean_title]
+    for year in query_years:
+        for month in month_tokens:
+            queries.append(f"{clean_title} {month} {year}")
+
+    seen: set[str] = set()
+    events: list[dict] = []
+    for query in queries:
+        try:
+            items = await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
+        except Exception:
+            continue
+        for item in items:
+            if item.get("isParkingEvent"):
+                continue
+            selection = _stubhub_item_to_selection(item, source="event")
+            canonical = selection.get("canonical_url")
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            events.append(selection)
+            if len(events) >= max_events:
+                return events
+    return events
+
+
+async def _fetch_expanded_parking_candidates_from_queries(title: str, max_events: int = 120) -> list[dict]:
+    clean_title = (title or "").strip()
+    if not clean_title:
+        return []
+
+    month_tokens = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    query_years = [date.today().year, date.today().year + 1]
+    queries = [f"parking passes only {clean_title}"]
+    for year in query_years:
+        for month in month_tokens:
+            queries.append(f"parking passes only {clean_title} {month} {year}")
+
+    seen: set[str] = set()
+    parking_events: list[dict] = []
+    for query in queries:
+        try:
+            items = await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
+        except Exception:
+            continue
+        for item in items:
+            if not item.get("isParkingEvent"):
+                continue
+            selection = _stubhub_item_to_selection(item, source="event")
+            canonical = selection.get("canonical_url")
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            parking_events.append(selection)
+            if len(parking_events) >= max_events:
+                return parking_events
+    return parking_events
+
+
+async def _resolve_client_search_parking_candidates(payload: dict, max_events: int) -> list[dict]:
+    selection_type = str(payload.get("selection_type") or "").lower()
+    selection_url = payload.get("canonical_url") or payload.get("url")
+    relationship_count = payload.get("relationship_count")
+
+    if selection_type not in {"performer", "grouping", "category", "venue"} or not selection_url:
+        parking_query = _build_parking_query_from_selection(payload)
+        return [
+            _stubhub_item_to_selection(item, source="event")
+            for item in await _fetch_stubhub_search_grid_items_paginated(
+                parking_query,
+                max_pages=max(3, min(8, (max_events + 19) // 20 + 2)),
+            )
+            if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
+        ][:max_events]
+
+    expanded = await _fetch_expanded_parking_candidates_from_queries(
+        payload.get("title") or payload.get("query") or "",
+        max_events=max(120, max_events * 2),
+    )
+    if expanded:
+        return expanded[:max_events]
+
+    parking_query = _build_parking_query_from_selection(payload)
+    return [
+        _stubhub_item_to_selection(item, source="event")
+        for item in await _fetch_stubhub_search_grid_items_paginated(parking_query, max_pages=8)
+        if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
+    ][:max_events]
 
 
 def _stubhub_selection_type(url: str | None) -> str:
@@ -505,6 +858,26 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
             meta_by_url[canonical] = item
 
     grouped: dict[str, dict] = {}
+    for item in search_items:
+        canonical = _canonical_stubhub_url(item.get("url"))
+        if not canonical:
+            continue
+        grouped.setdefault(
+            canonical,
+            {
+                "event_name": item.get("name") or item.get("title") or "",
+                "day_of_week": item.get("dayOfWeek") or "",
+                "formatted_date": item.get("formattedDate") or item.get("date") or "",
+                "formatted_time": item.get("formattedTime") or item.get("time") or "",
+                "venue_name": item.get("venueName") or item.get("venue_name") or "",
+                "location": item.get("formattedVenueLocation") or item.get("location") or "",
+                "parking_url": canonical,
+                "listing_count": 0,
+                "sort_ts": (((item.get("eventMetadata") or {}).get("common") or {}).get("eventStartDateTime") or 0),
+                "listings": [],
+            },
+        )
+
     for row in rows:
         canonical = _canonical_stubhub_url(row.get("parking_url") or row.get("event_url"))
         if not canonical:
@@ -551,6 +924,20 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
     for item in results:
         item.pop("sort_ts", None)
     return results
+
+
+def _client_search_payload_from_request_payload(payload: dict) -> dict:
+    return {
+        "title": (payload.get("title") or payload.get("query") or "").strip(),
+        "query": (payload.get("query") or payload.get("title") or "").strip(),
+        "source": payload.get("source") or "",
+        "selection_type": payload.get("selection_type") or "",
+        "canonical_url": payload.get("canonical_url") or payload.get("url") or "",
+        "url": payload.get("url") or payload.get("canonical_url") or "",
+        "relationship_count": payload.get("relationship_count"),
+        "location": payload.get("location") or "",
+        "venue_name": payload.get("venue_name") or payload.get("venueName") or "",
+    }
 
 
 @app.get("/ui/parking-links", response_class=HTMLResponse)
@@ -612,14 +999,9 @@ async def ui_client_search_run(request: Request):
     max_events = max(1, min(60, max_events))
 
     try:
-        parking_query = _build_parking_query_from_selection(payload)
-        parking_candidates = [
-            item for item in await _fetch_stubhub_search_grid_items_paginated(
-                parking_query,
-                max_pages=max(3, min(8, (max_events + 19) // 20 + 2)),
-            )
-            if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
-        ]
+        selection_payload = _client_search_payload_from_request_payload(payload)
+        parking_query = _build_parking_query_from_selection(selection_payload)
+        parking_candidates = await _resolve_client_search_parking_candidates(selection_payload, max_events=max_events)
         if not parking_candidates:
             return {
                 "success": True,
@@ -631,17 +1013,54 @@ async def ui_client_search_run(request: Request):
                 "errors": [],
             }
 
-        selected_candidates = parking_candidates[:max_events]
-        parking_urls = [
-            _canonical_stubhub_url(item.get("url"))
-            for item in selected_candidates
-            if _canonical_stubhub_url(item.get("url"))
-        ]
+        grouped_results = _group_client_search_results(parking_candidates, [])
+        return {
+            "success": True,
+            "query": (payload.get("query") or "").strip(),
+            "selection_title": (payload.get("title") or payload.get("query") or "").strip(),
+            "parking_query": parking_query,
+            "parking_events_found": len(parking_candidates),
+            "parking_events_scraped": 0,
+            "data": grouped_results,
+            "errors": [],
+        }
+    except Exception as exc:
+        logger.error(f"Client search run failed: {exc}")
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
 
+
+@app.post("/ticketing/ui/client-search/event-details")
+async def ui_client_search_event_details(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: dict = {}
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    parking_url = _canonical_stubhub_url(payload.get("parking_url") or payload.get("url") or payload.get("canonical_url"))
+    if not parking_url:
+        return JSONResponse({"success": False, "error": "parking_url is required"}, status_code=400)
+
+    search_item = {
+        "name": payload.get("event_name") or payload.get("title") or "",
+        "title": payload.get("event_name") or payload.get("title") or "",
+        "dayOfWeek": payload.get("day_of_week") or "",
+        "formattedDate": payload.get("formatted_date") or payload.get("date") or "",
+        "formattedTime": payload.get("formatted_time") or payload.get("time") or "",
+        "venueName": payload.get("venue_name") or payload.get("venueName") or "",
+        "formattedVenueLocation": payload.get("location") or "",
+        "url": parking_url,
+        "canonical_url": parking_url,
+        "eventMetadata": {},
+    }
+
+    try:
         phase2_result = await ticketing_phase2(
-            parking_urls=",".join(parking_urls),
-            limit=len(parking_urls),
-            batch_size=min(4, max(1, len(parking_urls))),
+            parking_urls=parking_url,
+            limit=1,
+            batch_size=1,
             export_json=False,
             persist=False,
             alert_on_failures=False,
@@ -649,20 +1068,17 @@ async def ui_client_search_run(request: Request):
         if isinstance(phase2_result, JSONResponse):
             return phase2_result
 
-        grouped_results = _group_client_search_results(selected_candidates, phase2_result.get("data") or [])
+        grouped_results = _group_client_search_results([search_item], phase2_result.get("data") or [])
+        card = grouped_results[0] if grouped_results else _group_client_search_results([search_item], [])[0]
         return {
             "success": True,
-            "query": (payload.get("query") or "").strip(),
-            "selection_title": (payload.get("title") or payload.get("query") or "").strip(),
-            "parking_query": parking_query,
-            "parking_events_found": len(parking_candidates),
-            "parking_events_scraped": len(selected_candidates),
-            "data": grouped_results,
+            "parking_url": parking_url,
+            "card": card,
             "errors": phase2_result.get("errors") or [],
         }
     except Exception as exc:
-        logger.error(f"Client search run failed: {exc}")
-        return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
+        logger.error(f"Client search event-details failed for {parking_url}: {exc}")
+        return JSONResponse({"success": False, "error": str(exc), "parking_url": parking_url}, status_code=502)
 
 
 @app.post("/ui/parking-links/run")

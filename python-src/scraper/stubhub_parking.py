@@ -26,6 +26,33 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
     _debug_dir: Path | None = None
 
     @staticmethod
+    def _listing_identifier(row: dict) -> str | None:
+        for key in ["listing_id", "inventory_id", "listing_key", "id"]:
+            value = row.get(key)
+            if value not in (None, ""):
+                return str(value)
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        for key in ["listingId", "inventoryId", "listingKey", "id"]:
+            value = details.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _listing_fallback_identity(row: dict) -> str:
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        parts = [
+            row.get("normalized_lot_name") or row.get("lot_name") or "",
+            row.get("price") or "",
+            row.get("availability") or "",
+            details.get("price_incl_fees") or "",
+            details.get("notes") or "",
+            details.get("title") or "",
+            row.get("_source") or "",
+        ]
+        return "|".join(str(part).strip() for part in parts)
+
+    @staticmethod
     def _is_generic_lot_name(value: str | None) -> bool:
         text = (value or "").strip()
         if not text:
@@ -53,8 +80,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         merged: dict[str, dict] = {}
         for collection in collections:
             for row in collection or []:
-                listing_id = row.get("listing_id")
-                key = str(listing_id) if listing_id else f"{row.get('lot_name')}|{row.get('price')}|{row.get('availability')}"
+                listing_id = StubHubParkingScraper._listing_identifier(row)
+                key = f"id:{listing_id}" if listing_id else f"fallback:{StubHubParkingScraper._listing_fallback_identity(row)}"
                 existing = merged.get(key)
                 if not existing:
                     merged[key] = dict(row)
@@ -93,6 +120,29 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
                 merged[key] = preferred
         return list(merged.values())
+
+    @staticmethod
+    def _filter_telemetry_rows(rows: list[dict]) -> list[dict]:
+        if not rows:
+            return rows
+
+        real_rows = [
+            row for row in rows
+            if not StubHubParkingScraper._is_generic_lot_name(row.get("lot_name"))
+            and (row.get("availability") or (row.get("listing_details") or {}).get("availability"))
+        ]
+        if not real_rows:
+            return rows
+
+        filtered = []
+        for row in rows:
+            details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+            if StubHubParkingScraper._is_generic_lot_name(row.get("lot_name")):
+                continue
+            if not row.get("availability") and not details.get("availability") and "embedded_xhr" in str(row.get("_source") or "").lower():
+                continue
+            filtered.append(row)
+        return filtered or real_rows
 
     @staticmethod
     def _currency_from_text(price_text: str) -> str:
@@ -188,20 +238,119 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
     def _price_from_object(obj: dict) -> str | None:
         if not isinstance(obj, dict):
             return None
-        for key in ["formattedPrice", "price", "listingPrice", "unitPrice"]:
-            if key in obj and obj[key] is not None:
-                return str(obj[key])
+
+        def pick(value) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                for nested_key in [
+                    "formatted",
+                    "display",
+                    "amount",
+                    "value",
+                    "formattedPrice",
+                    "currentPrice",
+                    "discountedPrice",
+                    "rawPrice",
+                ]:
+                    if value.get(nested_key) is not None:
+                        nested_value = value.get(nested_key)
+                        if nested_key == "rawPrice":
+                            normalized = StubHubParkingScraper._normalize_raw_price(nested_value)
+                            if normalized is not None:
+                                return str(normalized)
+                        return str(nested_value)
+                return None
+            return str(value)
+
+        # Prefer the live sale/current price that the site surfaces to users.
+        for key in [
+            "currentPrice",
+            "currentPriceWithFees",
+            "priceWithFees",
+            "discountedPrice",
+            "salePrice",
+            "displayPrice",
+            "priceInfo",
+            "priceDisplay",
+            "formattedPrice",
+            "price",
+            "listingPrice",
+            "unitPrice",
+        ]:
+            picked = pick(obj.get(key))
+            if picked is not None:
+                return picked
+
         if obj.get("rawPrice") is not None:
             normalized = StubHubParkingScraper._normalize_raw_price(obj.get("rawPrice"))
             if normalized is not None:
                 return str(normalized)
-        for key in ["displayPrice", "priceInfo"]:
-            if isinstance(obj.get(key), dict):
-                nested = obj[key]
-                for nk in ["formatted", "display", "amount", "value"]:
-                    if nk in nested and nested[nk] is not None:
-                        return str(nested[nk])
         return None
+
+    async def _count_visible_listing_nodes(self) -> int:
+        selectors = [
+            'div[role="button"].sc-194s59m-4',
+            '[data-testid*="listing"]',
+            'div[data-listing-id]',
+            '[role="listitem"]',
+        ]
+        max_count = 0
+        for selector in selectors:
+            try:
+                max_count = max(max_count, await self.page.locator(selector).count())
+            except Exception:
+                continue
+        return max_count
+
+    async def _load_all_listing_inventory(self) -> None:
+        stable_rounds = 0
+        last_visible_count = -1
+
+        for _ in range(24):
+            try:
+                show_more = self.page.get_by_role("button", name=re.compile("Show more|See more|Load more", re.IGNORECASE))
+                if await show_more.count() > 0 and await show_more.first.is_visible():
+                    await show_more.first.click()
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            try:
+                await self.page.evaluate(
+                    """() => {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        const candidates = Array.from(document.querySelectorAll('div, section, ul, main'))
+                            .filter((el) => {
+                                const style = window.getComputedStyle(el);
+                                const scrollable = el.scrollHeight > (el.clientHeight + 40);
+                                const overflowY = style.overflowY || '';
+                                return scrollable && ['auto', 'scroll'].includes(overflowY);
+                            })
+                            .sort((a, b) => b.scrollHeight - a.scrollHeight)
+                            .slice(0, 8);
+                        for (const el of candidates) {
+                            try { el.scrollTop = el.scrollHeight; } catch (e) {}
+                        }
+                    }"""
+                )
+            except Exception:
+                pass
+
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                await asyncio.sleep(1.2)
+
+            visible_count = await self._count_visible_listing_nodes()
+            if visible_count <= last_visible_count:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+            last_visible_count = max(last_visible_count, visible_count)
+
+            if stable_rounds >= 4:
+                break
 
     @staticmethod
     def _collect_listing_objects(root) -> list[dict]:
@@ -220,7 +369,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             if obj_id in seen_obj:
                 continue
             seen_obj.add(obj_id)
-            listing_id = cur.get("listingId") or cur.get("listing_id") or cur.get("id")
+            listing_id = (
+                cur.get("listingId")
+                or cur.get("listing_id")
+                or cur.get("inventoryId")
+                or cur.get("listingKey")
+                or cur.get("id")
+            )
             price = StubHubParkingScraper._price_from_object(cur)
             if listing_id and price:
                 results.append(cur)
@@ -598,7 +753,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         passes: list[dict] = []
         seen: set[str] = set()
         for row in found:
-            listing_id = row.get("listingId") or row.get("listing_id") or row.get("id")
+            listing_id = (
+                row.get("listingId")
+                or row.get("listing_id")
+                or row.get("inventoryId")
+                or row.get("listingKey")
+                or row.get("id")
+            )
             price_val = self._price_from_object(row)
             price = self._numeric_price(str(price_val)) if price_val is not None else None
             if not listing_id or not price:
@@ -630,8 +791,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "currency": None,
                     "availability": availability,
                     "listing_id": listing_id,
+                    "inventory_id": row.get("inventoryId"),
+                    "listing_key": row.get("listingKey"),
                     "_source": "state",
                     "listing_details": {
+                        "listingId": listing_id,
+                        "inventoryId": row.get("inventoryId"),
+                        "listingKey": row.get("listingKey"),
                         "title": lot_name,
                         "price_incl_fees": price_val,
                         "availability": availability,
@@ -652,7 +818,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         passes: list[dict] = []
         seen: set[str] = set()
         for row in found:
-            listing_id = row.get("listingId") or row.get("listing_id") or row.get("id")
+            listing_id = (
+                row.get("listingId")
+                or row.get("listing_id")
+                or row.get("inventoryId")
+                or row.get("listingKey")
+                or row.get("id")
+            )
             price_val = self._price_from_object(row)
             price = self._numeric_price(str(price_val)) if price_val is not None else None
             if not listing_id or not price:
@@ -684,8 +856,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "currency": None,
                     "availability": availability,
                     "listing_id": listing_id,
+                    "inventory_id": row.get("inventoryId"),
+                    "listing_key": row.get("listingKey"),
                     "_source": "payload_json",
                     "listing_details": {
+                        "listingId": listing_id,
+                        "inventoryId": row.get("inventoryId"),
+                        "listingKey": row.get("listingKey"),
                         "title": lot_name,
                         "price_incl_fees": price_val,
                         "availability": availability,
@@ -843,12 +1020,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     url_l = resp.url.lower()
                     interesting = any(
                         token in url_l
-                        for token in ["event", "listing", "inventory", "map", "log", "telemetry"]
+                        for token in ["event", "listing", "inventory", "map", "log", "telemetry", "api", "search", "tickets"]
                     )
                     if not interesting and "json" not in ct:
                         return
                     txt = await resp.text()
-                    if any(k in txt for k in ["visiblePopups", "listingId", "formattedPrice", "rawPrice", "listings", "listing", "availableQuantity"]):
+                    if any(k in txt for k in ["visiblePopups", "listingId", "formattedPrice", "rawPrice", "listings", "listing", "availableQuantity", "ticketClassName", "sectionName", "zoneName", "currentPrice", "priceWithFees"]):
                         captured_payloads.append(txt)
                         captured_urls.append(resp.url)
                 except Exception:
@@ -859,7 +1036,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     pd = req.post_data or ""
                     if not pd:
                         return
-                    if any(k in pd for k in ["visiblePopups", "VisibleSectionPopupsOnLoad", "listingId", "rawPrice", "formattedPrice"]):
+                    if any(k in pd for k in ["visiblePopups", "VisibleSectionPopupsOnLoad", "listingId", "rawPrice", "formattedPrice", "currentPrice", "priceWithFees"]):
                         captured_request_payloads.append(pd)
                         captured_request_urls.append(req.url)
                 except Exception:
@@ -878,41 +1055,9 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             await self.human_delay()
             await asyncio.sleep(2)
             
-            # Handle "Show more" button and lazy loading
-            logger.info("[Scraper] Checking for 'Show more' buttons...")
+            logger.info("[Scraper] Expanding and scrolling listing inventory...")
             try:
-                for i in range(15):  # Safety limit for clicking Show More
-                    show_more = self.page.get_by_role("button", name=re.compile("Show more", re.IGNORECASE))
-                    if await show_more.is_visible():
-                        logger.info(f"[Scraper] Clicking 'Show more' (iteration {i+1})...")
-                        await show_more.click()
-                        await asyncio.sleep(1.5)
-                    else:
-                        break
-                
-                # Final scroll to trigger hidden elements
-                logger.info("[Scraper] Performing final scrolls...")
-                for i in range(5):
-                    await self.page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(0.5)
-                    await asyncio.sleep(1.0)
-
-                # Scroll inside listings panel if it's virtualized
-                for _ in range(10):
-                    await self.page.evaluate(
-                        """() => {
-                            const candidates = [
-                              document.querySelector('[data-testid*="list"]'),
-                              document.querySelector('[data-testid*="listings"]'),
-                              document.querySelector('[role="list"]'),
-                              document.querySelector('div[aria-label*="list"]'),
-                            ].filter(Boolean);
-                            for (const el of candidates) {
-                              try { el.scrollTop = el.scrollHeight; } catch (e) {}
-                            }
-                        }"""
-                    )
-                    await asyncio.sleep(0.8)
+                await self._load_all_listing_inventory()
             except Exception:
                 pass
 
@@ -928,6 +1073,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 xhr_passes.extend(extracted)
 
             passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
+            passes = self._filter_telemetry_rows(passes)
 
             probe = {
                 "attempt": label,
