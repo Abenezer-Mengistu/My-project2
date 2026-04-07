@@ -2698,10 +2698,17 @@ async def _run_parking_for_event(event_row: dict) -> list[dict]:
 
     async def _task(page):
         instance = await scraper_cls.init(venue, page)
-        passes = await asyncio.wait_for(
-            instance.scrape_parking_details(event_obj),
-            timeout=120,
-        )
+        try:
+            passes = await asyncio.wait_for(
+                instance.scrape_parking_details(event_obj),
+                timeout=120,
+            )
+        except asyncio.TimeoutError as exc:
+            probe = getattr(instance, "_last_probe", {}) or {}
+            raise TimeoutError(
+                f"parking scrape exceeded 120s for {event_row.get('event_url')} "
+                f"(parking_url={event_row.get('parking_url')}, last_probe={probe})"
+            ) from exc
         return {
             "passes": passes,
             "probe": getattr(instance, "_last_probe", {}),

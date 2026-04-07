@@ -304,10 +304,17 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         return max_count
 
     async def _load_all_listing_inventory(self) -> None:
+        max_duration_seconds = 35.0
+        started_at = time.perf_counter()
         stable_rounds = 0
         last_visible_count = -1
 
         for _ in range(24):
+            if time.perf_counter() - started_at >= max_duration_seconds:
+                logger.info(
+                    f"[Scraper] Inventory expansion budget exhausted after {max_duration_seconds:.1f}s; proceeding with extraction."
+                )
+                break
             try:
                 show_more = self.page.get_by_role("button", name=re.compile("Show more|See more|Load more", re.IGNORECASE))
                 if await show_more.count() > 0 and await show_more.first.is_visible():
@@ -1013,6 +1020,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             captured_urls: list[str] = []
             captured_request_payloads: list[str] = []
             captured_request_urls: list[str] = []
+            response_tasks: set[asyncio.Task] = set()
 
             async def _capture_response(resp):
                 try:
@@ -1028,6 +1036,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     if any(k in txt for k in ["visiblePopups", "listingId", "formattedPrice", "rawPrice", "listings", "listing", "availableQuantity", "ticketClassName", "sectionName", "zoneName", "currentPrice", "priceWithFees"]):
                         captured_payloads.append(txt)
                         captured_urls.append(resp.url)
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     return
 
@@ -1042,54 +1052,77 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 except Exception:
                     return
 
-            self.page.on("response", lambda resp: asyncio.create_task(_capture_response(resp)))
-            self.page.on("request", _capture_request)
-            logger.info(f"[Scraper] Navigating to {url}")
             try:
-                await self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as e:
-                logger.warning(f"[Scraper] Initial goto failed/timed out: {e}")
-                await self.page.goto(url, wait_until="commit", timeout=45000)
-            
-            logger.info(f"[Scraper] Navigation complete. Waiting for stabilization...")
-            await self.human_delay()
-            await asyncio.sleep(2)
-            
-            logger.info("[Scraper] Expanding and scrolling listing inventory...")
-            try:
-                await self._load_all_listing_inventory()
-            except Exception:
-                pass
+                def _handle_response(resp):
+                    task = asyncio.create_task(_capture_response(resp))
+                    response_tasks.add(task)
+                    task.add_done_callback(response_tasks.discard)
 
-            dom_passes = await self._extract_passes_from_dom()
-            state_passes = await self._extract_passes_from_state()
-            embedded_passes = await self._extract_passes_from_embedded_json()
+                self.page.on("response", _handle_response)
+                self.page.on("request", _capture_request)
+                logger.info(f"[Scraper] Navigating to {url}")
+                try:
+                    await self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as e:
+                    logger.warning(f"[Scraper] Initial goto failed/timed out: {e}")
+                    await self.page.goto(url, wait_until="commit", timeout=45000)
 
-            xhr_passes: list[dict] = []
-            for payload in captured_payloads + captured_request_payloads:
-                extracted = self._extract_passes_from_json_payload(payload)
-                if not extracted:
-                    extracted = self._extract_passes_from_text(payload, source=f"embedded_xhr_{label}")
-                xhr_passes.extend(extracted)
+                logger.info(f"[Scraper] Navigation complete. Waiting for stabilization...")
+                await self.human_delay()
+                await asyncio.sleep(2)
 
-            passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
-            passes = self._filter_telemetry_rows(passes)
+                logger.info("[Scraper] Expanding and scrolling listing inventory...")
+                try:
+                    await self._load_all_listing_inventory()
+                except Exception as exc:
+                    logger.warning(f"[Scraper] Inventory expansion failed; continuing with partial page state: {exc}")
 
-            probe = {
-                "attempt": label,
-                "url": self.page.url,
-                "title": (await self.page.title()),
-                "captured_payloads": len(captured_payloads),
-                "captured_urls": captured_urls[:5],
-                "captured_request_payloads": len(captured_request_payloads),
-                "captured_request_urls": captured_request_urls[:5],
-                "dom_passes": len(dom_passes),
-                "state_passes": len(state_passes),
-                "embedded_passes": len(embedded_passes),
-                "xhr_passes": len(xhr_passes),
-                "merged_passes": len(passes),
-            }
-            return passes, probe
+                dom_passes = await self._extract_passes_from_dom()
+                state_passes = await self._extract_passes_from_state()
+                embedded_passes = await self._extract_passes_from_embedded_json()
+
+                if response_tasks:
+                    await asyncio.gather(*list(response_tasks), return_exceptions=True)
+
+                xhr_passes: list[dict] = []
+                for payload in captured_payloads + captured_request_payloads:
+                    extracted = self._extract_passes_from_json_payload(payload)
+                    if not extracted:
+                        extracted = self._extract_passes_from_text(payload, source=f"embedded_xhr_{label}")
+                    xhr_passes.extend(extracted)
+
+                passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
+                passes = self._filter_telemetry_rows(passes)
+
+                probe = {
+                    "attempt": label,
+                    "url": self.page.url,
+                    "title": (await self.page.title()),
+                    "captured_payloads": len(captured_payloads),
+                    "captured_urls": captured_urls[:5],
+                    "captured_request_payloads": len(captured_request_payloads),
+                    "captured_request_urls": captured_request_urls[:5],
+                    "dom_passes": len(dom_passes),
+                    "state_passes": len(state_passes),
+                    "embedded_passes": len(embedded_passes),
+                    "xhr_passes": len(xhr_passes),
+                    "merged_passes": len(passes),
+                }
+                return passes, probe
+            finally:
+                try:
+                    self.page.remove_listener("response", _handle_response)
+                except Exception:
+                    pass
+                try:
+                    self.page.remove_listener("request", _capture_request)
+                except Exception:
+                    pass
+                for task in list(response_tasks):
+                    if not task.done():
+                        task.cancel()
+                if response_tasks:
+                    await asyncio.gather(*list(response_tasks), return_exceptions=True)
 
         primary_url = event.parking_url
         if not primary_url or "parking-passes-only" not in primary_url.lower():
