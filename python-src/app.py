@@ -11,6 +11,7 @@ import json
 import os
 import time
 from datetime import date, datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from types import SimpleNamespace
 import re
@@ -25,6 +26,7 @@ from discovery.stubhub_discovery import StubHubDiscoveryScraper
 from discovery.stubhub_snapshot_service import StubHubSnapshotService
 from discovery.ticket_data_transform import TicketDataTransformService
 from discovery.venue_parser import VenueParser
+from scraper.spothero_parking import SpotHeroParkingScraper, build_spothero_event
 from scraper.stubhub_parking import StubHubParkingScraper
 from scraper.ticketing_controller import TicketingController
 from scraper.playwright_cluster import PlaywrightClusterManager
@@ -33,6 +35,7 @@ from scraper.stubhub_venue_updater import discover_and_update_venues
 # Register scrapers with their domain controller
 TicketingController.register_scraper(StubHubDiscoveryScraper)
 TicketingController.register_scraper(StubHubParkingScraper)
+TicketingController.register_scraper(SpotHeroParkingScraper)
 
 from config import CONFIG
 from config import __NODE_ENV_DEV
@@ -69,6 +72,247 @@ def _storage_output_path(excel_path: str) -> Path:
     return STORAGE_EXPORTS / name
 
 
+def _live_cache_get(key: str, ttl_seconds: int) -> object | None:
+    entry = _spothero_live_cache.get(key)
+    if not entry:
+        return None
+    stored_at = entry.get("stored_at")
+    if not isinstance(stored_at, (int, float)) or time.time() - stored_at > ttl_seconds:
+        _spothero_live_cache.pop(key, None)
+        return None
+    return entry.get("value")
+
+
+def _live_cache_set(key: str, value: object) -> object:
+    _spothero_live_cache[key] = {"stored_at": time.time(), "value": value}
+    return value
+
+
+async def _fetch_text(url: str, *, ttl_seconds: int | None = None) -> str:
+    cache_key = f"text:{url}"
+    if ttl_seconds:
+        cached = _live_cache_get(cache_key, ttl_seconds)
+        if isinstance(cached, str):
+            return cached
+    async with httpx.AsyncClient(
+        headers=SPOTHERO_PUBLIC_HEADERS,
+        timeout=45.0,
+        follow_redirects=True,
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        text = response.text
+    if ttl_seconds:
+        _live_cache_set(cache_key, text)
+    return text
+
+
+def _extract_next_data(raw_html: str) -> dict:
+    match = _SPOTHERO_NEXT_DATA_RE.search(raw_html or "")
+    if not match:
+        raise ValueError("SpotHero page missing __NEXT_DATA__ payload")
+    return json.loads(html.unescape(match.group("payload")))
+
+
+def _normalize_live_search_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _score_live_match(query: str, *parts: str) -> int:
+    q = _normalize_live_search_text(query)
+    if not q:
+        return 1
+    hay = " ".join(_normalize_live_search_text(part) for part in parts if part).strip()
+    if not hay:
+        return 0
+    if hay.startswith(q):
+        return 100
+    if f" {q}" in hay:
+        return 80
+    if q in hay:
+        return 60
+    q_tokens = q.split()
+    if q_tokens and all(token in hay for token in q_tokens):
+        return 40
+    return 0
+
+
+async def _fetch_spothero_cities() -> list[dict]:
+    cached = _live_cache_get("spothero:cities", 1800)
+    if isinstance(cached, list):
+        return cached
+    raw = await _fetch_text("https://spothero.com/cities/", ttl_seconds=1800)
+    payload = _extract_next_data(raw)
+    cities = (((payload.get("props") or {}).get("pageProps") or {}).get("cities") or [])
+    normalized = [
+        {
+            "slug": str(item.get("slug") or "").strip(),
+            "title": str(item.get("title") or "").strip(),
+            "country_code": str(item.get("countryCode") or "").strip(),
+        }
+        for item in cities
+        if isinstance(item, dict) and item.get("slug") and item.get("title")
+    ]
+    return _live_cache_set("spothero:cities", normalized)
+
+
+async def _fetch_spothero_city_page(city_slug: str) -> dict:
+    cache_key = f"spothero:city:{city_slug}"
+    cached = _live_cache_get(cache_key, 900)
+    if isinstance(cached, dict):
+        return cached
+    raw = await _fetch_text(f"https://spothero.com/city/{city_slug}-parking", ttl_seconds=900)
+    payload = _extract_next_data(raw)
+    page_props = ((payload.get("props") or {}).get("pageProps") or {})
+    city_payload = {
+        "popular_destinations": page_props.get("popularDestinations") if isinstance(page_props.get("popularDestinations"), list) else [],
+        "performer_list": page_props.get("performerList") if isinstance(page_props.get("performerList"), list) else [],
+    }
+    return _live_cache_set(cache_key, city_payload)
+
+
+def _destination_summary_from_city(city: dict, item: dict) -> dict:
+    path = str(item.get("link") or "").strip()
+    destination_id = item.get("id")
+    title = str(item.get("title") or "").strip()
+    city_title = str(city.get("title") or "").strip()
+    return {
+        "destination_id": int(destination_id) if destination_id is not None else None,
+        "title": title,
+        "city": city_title,
+        "path": path,
+        "destination_page_url": f"https://spothero.com{path}" if path.startswith("/") else path,
+        "search_url": (
+            f"https://spothero.com/search?kind=destination&id={int(destination_id)}"
+            if destination_id is not None
+            else None
+        ),
+    }
+
+
+async def _fetch_spothero_destination_index() -> list[dict]:
+    cached = _live_cache_get("spothero:destination-index", 3600)
+    if isinstance(cached, list):
+        return cached
+
+    cities = await _fetch_spothero_cities()
+    semaphore = asyncio.Semaphore(8)
+
+    async def _load_city(city: dict) -> list[dict]:
+        async with semaphore:
+            try:
+                page = await _fetch_spothero_city_page(str(city.get("slug") or ""))
+            except Exception:
+                return []
+            return [
+                _destination_summary_from_city(city, destination)
+                for destination in page.get("popular_destinations", [])
+                if isinstance(destination, dict)
+            ]
+
+    all_rows = await asyncio.gather(*[_load_city(city) for city in cities])
+    seen: set[tuple] = set()
+    flattened: list[dict] = []
+    for rows in all_rows:
+        for row in rows:
+            key = (row.get("destination_id"), row.get("path"))
+            if key in seen:
+                continue
+            seen.add(key)
+            flattened.append(row)
+    flattened.sort(key=lambda item: (item.get("city") or "", item.get("title") or ""))
+    return _live_cache_set("spothero:destination-index", flattened)
+
+
+async def _live_destination_suggestions(query: str) -> list[dict]:
+    cities = await _fetch_spothero_cities()
+    scored_cities = []
+    for city in cities:
+        score = _score_live_match(query, city.get("title") or "", city.get("slug") or "")
+        if score > 0:
+            scored_cities.append((score, city))
+    scored_cities.sort(key=lambda item: (-item[0], item[1].get("title", "")))
+
+    suggestions: list[dict] = []
+    seen: set[tuple] = set()
+    for city in [city for _, city in scored_cities[:3]]:
+        page = await _fetch_spothero_city_page(str(city.get("slug") or ""))
+        for destination in page.get("popular_destinations", []):
+            if not isinstance(destination, dict):
+                continue
+            suggestion = _destination_summary_from_city(city, destination)
+            match_score = _score_live_match(query, suggestion.get("city") or "", suggestion.get("title") or "")
+            if match_score <= 0:
+                continue
+            key = (suggestion.get("destination_id"), suggestion.get("path"))
+            if key in seen:
+                continue
+            seen.add(key)
+            suggestion["match_score"] = match_score
+            suggestions.append(suggestion)
+
+    if not suggestions:
+        for suggestion in await _fetch_spothero_destination_index():
+            match_score = _score_live_match(query, suggestion.get("city") or "", suggestion.get("title") or "")
+            if match_score <= 0:
+                continue
+            enriched = dict(suggestion)
+            enriched["match_score"] = match_score
+            suggestions.append(enriched)
+
+    suggestions.sort(key=lambda item: (-int(item.get("match_score") or 0), item.get("city") or "", item.get("title") or ""))
+    return suggestions[:8]
+
+
+def _extract_event_schemas(raw_html: str) -> list[dict]:
+    events: list[dict] = []
+    for match in _SPOTHERO_EVENT_SCHEMA_RE.finditer(raw_html or ""):
+        try:
+            payload = json.loads(html.unescape(match.group("payload")))
+        except Exception:
+            continue
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    events.append(item)
+        elif isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
+async def _geocode_address(address_text: str) -> tuple[str | None, str | None]:
+    cache_key = f"geocode:{address_text}"
+    cached = _live_cache_get(cache_key, 86400)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        return cached
+    async with httpx.AsyncClient(
+        headers={**SPOTHERO_PUBLIC_HEADERS, "Referer": "https://spothero.com/"},
+        timeout=25.0,
+        follow_redirects=True,
+    ) as client:
+        response = await client.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"format": "jsonv2", "limit": 1, "q": address_text},
+        )
+        response.raise_for_status()
+        rows = response.json()
+    if isinstance(rows, list) and rows:
+        first = rows[0] or {}
+        lat = str(first.get("lat") or "").strip() or None
+        lon = str(first.get("lon") or "").strip() or None
+        return _live_cache_set(cache_key, (lat, lon))
+    return _live_cache_set(cache_key, (None, None))
+
+
+def _format_usd_price(value: object) -> str:
+    if value in (None, ""):
+        return ""
+    amount = extract_total_price({"price": value})
+    if amount is None:
+        return ""
+    return f"${amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
+
+
 # Registered domain controllers
 _controllers = {
     TicketingController.domain: TicketingController(),
@@ -85,6 +329,19 @@ _stubhub_rates_cache: dict[str, object] = {
     "updated_at": None,
     "rates": None,
 }
+_spothero_live_cache: dict[str, dict[str, object]] = {}
+SPOTHERO_PUBLIC_HEADERS = {
+    "User-Agent": CONFIG["app"]["default_user_agent"],
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_SPOTHERO_NEXT_DATA_RE = re.compile(
+    r'<script[^>]*id="__NEXT_DATA__"[^>]*type="application/json"[^>]*>(?P<payload>.+?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+_SPOTHERO_EVENT_SCHEMA_RE = re.compile(
+    r'<script[^>]*type="application/ld\+json"[^>]*>(?P<payload>.+?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
@@ -820,19 +1077,19 @@ def _build_parking_query_from_selection(payload: dict) -> str:
 
 
 def _price_display_for_row(row: dict) -> str:
-    price = row.get("price")
-    currency = (row.get("currency") or "").upper()
-    if price in (None, ""):
-        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
-        raw_price = (details.get("price_incl_fees") or "").strip()
-        if raw_price:
-            return raw_price
-        return ""
-    if currency == "USD":
-        return f"${price}"
-    if currency:
-        return f"{currency} {price}"
-    return str(price)
+    metrics = compute_listing_metrics(row)
+    normalized_price = metrics.get("extracted_price")
+    if normalized_price not in (None, ""):
+        try:
+            return f"${Decimal(str(normalized_price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
+        except Exception:
+            return f"${normalized_price}"
+
+    details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+    raw_price = str(details.get("price_incl_fees") or "").strip()
+    if raw_price:
+        return raw_price
+    return ""
 
 
 def _clean_listing_notes(value: str | None, lot_name: str | None = None) -> str:
@@ -940,6 +1197,289 @@ def _client_search_payload_from_request_payload(payload: dict) -> dict:
     }
 
 
+def _build_spothero_queries_from_selection(payload: dict) -> list[str]:
+    title = str(payload.get("title") or payload.get("query") or "").strip()
+    venue_name = str(payload.get("venue_name") or "").strip()
+    location = str(payload.get("location") or "").strip()
+    city = location.split(",", 1)[0].strip() if location else ""
+
+    candidates = [
+        venue_name,
+        title,
+        f"{venue_name} {city}".strip(),
+        f"{title} {city}".strip(),
+    ]
+    if " at " in title.lower():
+        candidates.append(re.split(r"\bat\b", title, flags=re.IGNORECASE)[-1].strip())
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        normalized = _normalize_live_search_text(item)
+        if len(normalized) < 2 or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(item.strip())
+    return ordered
+
+
+async def _pick_best_spothero_suggestion(payload: dict) -> tuple[dict | None, list[dict], str]:
+    query_candidates = _build_spothero_queries_from_selection(payload)
+    all_suggestions: list[dict] = []
+    best: dict | None = None
+    best_score = -1
+    best_query = ""
+
+    venue_name = str(payload.get("venue_name") or "").strip()
+    title = str(payload.get("title") or payload.get("query") or "").strip()
+    location = str(payload.get("location") or "").strip()
+
+    for query in query_candidates:
+        suggestions = await _live_destination_suggestions(query)
+        for suggestion in suggestions:
+            enriched = dict(suggestion)
+            composite_score = (
+                int(enriched.get("match_score") or 0)
+                + _score_live_match(venue_name or query, enriched.get("title") or "")
+                + _score_live_match(title or query, enriched.get("title") or "")
+                + _score_live_match(location or query, enriched.get("city") or "")
+            )
+            enriched["composite_score"] = composite_score
+            enriched["query_used"] = query
+            all_suggestions.append(enriched)
+            if composite_score > best_score:
+                best = enriched
+                best_score = composite_score
+                best_query = query
+
+    deduped: list[dict] = []
+    seen: set[tuple] = set()
+    for suggestion in sorted(
+        all_suggestions,
+        key=lambda item: (-int(item.get("composite_score") or 0), item.get("city") or "", item.get("title") or ""),
+    ):
+        key = (suggestion.get("destination_id"), suggestion.get("path"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(suggestion)
+    return best, deduped[:6], best_query
+
+
+async def _run_spothero_for_event(event_row: dict) -> dict:
+    event_obj = build_spothero_event(
+        venue_name=event_row.get("venue") or "SpotHero Venue",
+        event_name=event_row.get("event_name") or "SpotHero Parking",
+        event_url=event_row.get("event_url") or event_row.get("parking_url") or "",
+        parking_url=event_row.get("parking_url") or event_row.get("event_url") or "",
+        max_parking_coverage=bool(event_row.get("max_parking_coverage")),
+    )
+    venue = SimpleNamespace(
+        name=event_row.get("venue") or "SpotHero Venue",
+        stubhub_url=event_row.get("event_url") or event_row.get("parking_url") or "",
+        handler="spothero-parking",
+        proxy=None,
+        user_agent=None,
+    )
+
+    async def _task(page):
+        instance = await SpotHeroParkingScraper.init(venue, page)
+        passes = await asyncio.wait_for(instance.scrape_parking_details(event_obj), timeout=120)
+        return {"passes": passes}
+
+    cluster = await PlaywrightClusterManager.get_or_create(None)
+    return await cluster.execute(_task)
+
+
+def _spothero_listing_from_pass(row: dict) -> dict:
+    details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+    total_display = details.get("price_incl_fees") or _format_usd_price(row.get("price"))
+    subtotal_display = details.get("subtotal_display") or ""
+    fee_display = details.get("service_fee_display") or ""
+    notes = " • ".join(part for part in [f"Subtotal {subtotal_display}" if subtotal_display else "", f"Fees {fee_display}" if fee_display else ""] if part)
+    price_value = extract_total_price({"price": total_display or row.get("price")})
+    return {
+        "lot_name": row.get("lot_name") or "",
+        "normalized_lot_name": row.get("normalized_lot_name") or normalize_lot_name(row.get("lot_name") or ""),
+        "availability": row.get("availability") or "",
+        "price_display": total_display or "",
+        "price_value": float(price_value) if price_value is not None else None,
+        "currency": "USD",
+        "notes": notes,
+        "listing_id": row.get("listing_id") or "",
+        "available_spaces": row.get("available_spaces"),
+        "source": row.get("_source") or "spothero_api",
+    }
+
+
+def _format_spothero_window_label(starts: str | None, ends: str | None) -> str:
+    def _fmt(value: str | None) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            normalized = text.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+            return dt.strftime("%b %d, %Y %I:%M %p")
+        except Exception:
+            return text
+
+    start_label = _fmt(starts)
+    end_label = _fmt(ends)
+    if start_label and end_label:
+        return f"{start_label} to {end_label}"
+    return start_label or end_label
+
+
+async def _fetch_live_spothero_destination_details(destination_id: int, destination_path: str) -> dict:
+    destination_url = destination_path if destination_path.startswith("http") else f"https://spothero.com{destination_path}"
+    raw = await _fetch_text(destination_url, ttl_seconds=300)
+    next_data = _extract_next_data(raw)
+    page_props = ((next_data.get("props") or {}).get("pageProps") or {})
+    events = [item for item in _extract_event_schemas(raw) if isinstance(item, dict)]
+
+    destination_title = None
+    city_name = None
+    state_code = None
+    address_bits: list[str] = []
+    event_urls: list[str] = []
+
+    for event_schema in events:
+        location = event_schema.get("location") if isinstance(event_schema.get("location"), dict) else {}
+        address = location.get("address") if isinstance(location.get("address"), dict) else {}
+        if not destination_title:
+            destination_title = (
+                address.get("name")
+                or location.get("name")
+                or event_schema.get("name")
+            )
+            city_name = address.get("addressLocality")
+            state_code = address.get("addressRegion")
+            address_bits = [
+                str(address.get("streetAddress") or "").strip(),
+                str(address.get("addressLocality") or "").strip(),
+                str(address.get("addressRegion") or "").strip(),
+                str(address.get("postalCode") or "").strip(),
+            ]
+        url = str(event_schema.get("url") or "").strip()
+        if url and "spothero.com" in url:
+            event_urls.append(url)
+
+    search_request = page_props.get("searchRequest") if isinstance(page_props.get("searchRequest"), dict) else {}
+    window_starts = str(search_request.get("starts") or "").strip() or None
+    window_ends = str(search_request.get("ends") or "").strip() or None
+    airport_payload = page_props.get("airport") if isinstance(page_props.get("airport"), dict) else {}
+    if airport_payload:
+        destination_title = destination_title or str(airport_payload.get("title") or "").strip() or None
+        city_name = city_name or str(airport_payload.get("city") or "").strip() or None
+        state_code = state_code or str(airport_payload.get("state") or "").strip() or None
+        if not address_bits:
+            address_bits = [
+                str(airport_payload.get("street_address") or "").strip(),
+                str(airport_payload.get("city") or "").strip(),
+                str(airport_payload.get("state") or "").strip(),
+                str(airport_payload.get("zipcode") or "").strip(),
+            ]
+
+    address_text = ", ".join(bit for bit in address_bits if bit)
+    lat = lon = None
+    if airport_payload.get("latitude") is not None and airport_payload.get("longitude") is not None:
+        lat = str(airport_payload.get("latitude"))
+        lon = str(airport_payload.get("longitude"))
+    elif address_text:
+        lat, lon = await _geocode_address(address_text)
+
+    listing_rows: list[dict] = []
+    price_source_url = None
+    detail_mode = "destination"
+
+    if lat and lon:
+        params = {
+            "kind": "destination",
+            "id": str(destination_id),
+            "lat": lat,
+            "lon": lon,
+        }
+        if search_request.get("starts"):
+            params["starts"] = str(search_request.get("starts"))
+        if search_request.get("ends"):
+            params["ends"] = str(search_request.get("ends"))
+        destination_search_url = f"https://spothero.com/search?{urlencode(params)}"
+        price_source_url = destination_search_url
+        live_result = await _run_spothero_for_event(
+            {
+                "venue": destination_title or "SpotHero Destination",
+                "event_name": f"Parking near {destination_title or 'destination'}",
+                "event_url": destination_url,
+                "parking_url": destination_search_url,
+            }
+        )
+        listing_rows = [_spothero_listing_from_pass(item) for item in live_result.get("passes") or []]
+
+    if not listing_rows and event_urls:
+        detail_mode = "event_fallback"
+        fallback_event_url = event_urls[0]
+        price_source_url = fallback_event_url
+        live_result = await _run_spothero_for_event(
+            {
+                "venue": destination_title or "SpotHero Destination",
+                "event_name": str(events[0].get("name") or destination_title or "SpotHero Event"),
+                "event_url": fallback_event_url,
+                "parking_url": fallback_event_url,
+            }
+        )
+        listing_rows = [_spothero_listing_from_pass(item) for item in live_result.get("passes") or []]
+
+    if not listing_rows:
+        raise ValueError("Unable to fetch live SpotHero listings for this destination")
+
+    listing_rows.sort(
+        key=lambda item: (
+            item.get("price_value") is None,
+            item.get("price_value") if item.get("price_value") is not None else float("inf"),
+            item.get("lot_name") or "",
+        )
+    )
+    numeric_prices = [item.get("price_value") for item in listing_rows if item.get("price_value") is not None]
+    parking_window_label = _format_spothero_window_label(window_starts, window_ends)
+    for item in listing_rows:
+        if parking_window_label:
+            item["price_window"] = parking_window_label
+        if window_starts:
+            item["price_window_start"] = window_starts
+        if window_ends:
+            item["price_window_end"] = window_ends
+    return {
+        "destination_id": destination_id,
+        "destination_title": destination_title or str(((page_props.get("query") or {}).get("destination") or "")).replace("-parking", "").replace("-", " ").title(),
+        "city": city_name,
+        "state": state_code,
+        "address": address_text,
+        "destination_page_url": destination_url,
+        "price_source_url": price_source_url,
+        "detail_mode": detail_mode,
+        "coordinates": {"lat": lat, "lon": lon} if lat and lon else None,
+        "listing_summary": {
+            "count": len(listing_rows),
+            "min_price": min(numeric_prices) if numeric_prices else None,
+            "max_price": max(numeric_prices) if numeric_prices else None,
+        },
+        "price_window": parking_window_label,
+        "price_window_start": window_starts,
+        "price_window_end": window_ends,
+        "listings": listing_rows,
+        "upcoming_events": [
+            {
+                "name": str(item.get("name") or "").strip(),
+                "starts_at": item.get("startDate"),
+                "url": str(item.get("url") or "").strip(),
+            }
+            for item in events[:6]
+            if str(item.get("name") or "").strip() and str(item.get("url") or "").strip()
+        ],
+    }
+
+
 @app.get("/ui/parking-links", response_class=HTMLResponse)
 async def ui_parking_links():
     page = UI_DIR / "parking_links.html"
@@ -978,6 +1518,51 @@ async def ui_client_search_suggest(q: str = "", limit: int = 12):
         return {"success": True, "query": query, "suggestions": suggestions}
     except Exception as exc:
         logger.warning(f"Client search suggest failed for query={query!r}: {exc}")
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
+
+
+@app.post("/ticketing/ui/client-search/spothero")
+async def ui_client_search_spothero(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: dict = {}
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    try:
+        selection_payload = _client_search_payload_from_request_payload(payload)
+        best, suggestions, matched_query = await _pick_best_spothero_suggestion(selection_payload)
+        if not best or not best.get("destination_id") or not best.get("path"):
+            return {
+                "success": True,
+                "matched_query": matched_query,
+                "details": None,
+                "suggestions": suggestions,
+            }
+
+        details = await _fetch_live_spothero_destination_details(
+            int(best["destination_id"]),
+            str(best["path"]),
+        )
+        details["matched_query"] = best.get("query_used") or matched_query
+        details["matched_destination"] = {
+            "destination_id": best.get("destination_id"),
+            "title": best.get("title"),
+            "city": best.get("city"),
+            "path": best.get("path"),
+            "destination_page_url": best.get("destination_page_url"),
+            "search_url": best.get("search_url"),
+        }
+        return {
+            "success": True,
+            "matched_query": details.get("matched_query") or matched_query,
+            "details": details,
+            "suggestions": suggestions,
+        }
+    except Exception as exc:
+        logger.error(f"Client search SpotHero lookup failed: {exc}")
         return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
 
 

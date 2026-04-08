@@ -70,7 +70,6 @@ CURRENCY_MAP = {
     "$": "USD",
     "€": "EUR",
     "£": "GBP",
-    "R": "ZAR",
     "C$": "CAD",
     "A$": "AUD",
 }
@@ -86,6 +85,11 @@ def currency_from_listing(listing: dict) -> str:
     details = listing.get("listing_details") if isinstance(listing.get("listing_details"), dict) else {}
     price_str = details.get("price_incl_fees") or listing.get("price_incl_fees") or listing.get("price") or ""
     if isinstance(price_str, str):
+        # StubHub US pages can emit a bare "R" glyph in the DOM while the actual
+        # user-facing price is still USD. Only treat ZAR explicitly when ZAR is present.
+        upper_price = price_str.upper()
+        if "ZAR" in upper_price:
+            return "ZAR"
         for symbol, code in CURRENCY_MAP.items():
             if symbol in price_str:
                 return code
