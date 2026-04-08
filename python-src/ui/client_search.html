@@ -19,8 +19,30 @@
         --bad: #ef6b6b;
         --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
       }
+      :root[data-theme="light"] {
+        --bg: #f5f7fc;
+        --panel: #ffffff;
+        --panel-2: #f3f6fc;
+        --text: #11203b;
+        --muted: #5c6e8f;
+        --border: rgba(15, 27, 54, 0.1);
+        --accent: #245cf0;
+        --accent-2: #0d8a63;
+        --shadow: 0 24px 60px rgba(27, 45, 94, 0.08);
+      }
+      :root[data-theme="dark"] {
+        --bg: #0a1220;
+        --panel: #111b2d;
+        --panel-2: #16233b;
+        --text: #edf3ff;
+        --muted: #9fb0d0;
+        --border: rgba(255, 255, 255, 0.1);
+        --accent: #78a7ff;
+        --accent-2: #63d2a2;
+        --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+      }
       @media (prefers-color-scheme: light) {
-        :root {
+        :root:not([data-theme]) {
           --bg: #f5f7fc;
           --panel: #ffffff;
           --panel-2: #f3f6fc;
@@ -49,6 +71,26 @@
       }
       .hero {
         padding: 18px 0 16px;
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .heroCopy {
+        flex: 1 1 720px;
+      }
+      .themeToggle {
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 10px 14px;
+        font: inherit;
+        font-size: 13px;
+        color: var(--text);
+        background: var(--panel);
+        cursor: pointer;
+        box-shadow: var(--shadow);
+        white-space: nowrap;
       }
       .eyebrow {
         font-size: 12px;
@@ -397,12 +439,15 @@
   <body>
     <div class="shell">
       <div class="hero">
-        <div class="eyebrow">Parking Comparison Search</div>
-        <h1>Search events, load parking inventory, and compare listings side by side.</h1>
-        <div class="sub">
-          Use the left search to find live event results and parking inventory. Then use the right search to look up a
-          matching venue and compare pricing across both sources in USD.
+        <div class="heroCopy">
+          <div class="eyebrow">Parking Comparison Search</div>
+          <h1>Search events, load parking inventory, and compare listings side by side.</h1>
+          <div class="sub">
+            Use the left search to find live event results and parking inventory. Then use the right search to look up a
+            matching venue and compare pricing across both sources in USD.
+          </div>
         </div>
+        <button id="themeToggleBtn" class="themeToggle" type="button">Toggle Dark Mode</button>
       </div>
 
       <div class="searchPanel">
@@ -503,6 +548,7 @@
       const downloadStubhubBtn = el("downloadStubhubBtn");
       const downloadSpotheroBtn = el("downloadSpotheroBtn");
       const downloadBothBtn = el("downloadBothBtn");
+      const themeToggleBtn = el("themeToggleBtn");
 
       let suggestions = [];
       let activeIndex = -1;
@@ -517,6 +563,32 @@
       let progressiveRunId = 0;
       let currentSpotHeroDetails = null;
       let currentSpotHeroSuggestions = [];
+
+      function applyTheme(theme) {
+        const root = document.documentElement;
+        if (theme === "light" || theme === "dark") {
+          root.setAttribute("data-theme", theme);
+          try {
+            localStorage.setItem("client-search-theme", theme);
+          } catch (error) {}
+          themeToggleBtn.textContent = theme === "dark" ? "Switch to Light Mode" : "Switch to Dark Mode";
+          return;
+        }
+        root.removeAttribute("data-theme");
+        themeToggleBtn.textContent = "Toggle Dark Mode";
+      }
+
+      function initializeTheme() {
+        let storedTheme = "";
+        try {
+          storedTheme = localStorage.getItem("client-search-theme") || "";
+        } catch (error) {}
+        if (storedTheme === "light" || storedTheme === "dark") {
+          applyTheme(storedTheme);
+        } else {
+          applyTheme("dark");
+        }
+      }
 
       function escapeHtml(str) {
         return String(str || "")
@@ -594,6 +666,49 @@
         text = text.replace(/\s+parking passes?$/i, "");
         text = text.replace(/\s+parking$/i, "");
         return text.trim();
+      }
+
+      function formatSpotHeroDateTime(value) {
+        const text = String(value || "").trim();
+        if (!text) {
+          return "";
+        }
+        const date = new Date(text);
+        if (Number.isNaN(date.getTime())) {
+          return text;
+        }
+        return new Intl.DateTimeFormat("en-US", {
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        }).format(date);
+      }
+
+      function formatSpotHeroRange(start, end) {
+        const startLabel = formatSpotHeroDateTime(start);
+        const endLabel = formatSpotHeroDateTime(end);
+        if (startLabel && endLabel) {
+          return `${startLabel} to ${endLabel}`;
+        }
+        return startLabel || endLabel;
+      }
+
+      function formatSpotHeroAvailability(listing) {
+        const parts = [];
+        if (listing && listing.availability) {
+          parts.push(String(listing.availability));
+        }
+        if (listing && listing.available_spaces != null && listing.available_spaces !== "") {
+          const count = Number(listing.available_spaces);
+          if (Number.isFinite(count)) {
+            parts.push(`${count} spaces available`);
+          } else {
+            parts.push(`${listing.available_spaces} spaces available`);
+          }
+        }
+        return parts.join(" | ");
       }
 
       function lotMatchesFilter(listing) {
@@ -873,26 +988,30 @@
         const listingMarkup = visibleListings.length
           ? visibleListings
               .map(
-                (listing) => `
-                  <div class="listingCard">
-                    <div class="listingTop">
-                      <h3 class="listingName">${escapeHtml(listing.lot_name)}</h3>
-                      <div class="listingPrice">${escapeHtml(listing.price_display || "")}</div>
+                (listing) => {
+                  const reservationRange = formatSpotHeroRange(listing.reservation_starts, listing.reservation_ends) || listing.price_window || "";
+                  const availabilityLabel = formatSpotHeroAvailability(listing);
+                  return `
+                    <div class="listingCard">
+                      <div class="listingTop">
+                        <h3 class="listingName">${escapeHtml(listing.lot_name)}</h3>
+                        <div class="listingPrice">${escapeHtml(listing.price_display || "")}</div>
+                      </div>
+                      <div class="listingMeta">
+                        ${listing.reservation_type ? `<div>${escapeHtml(listing.reservation_type)}</div>` : ""}
+                        ${reservationRange ? `<div>${escapeHtml(reservationRange)}</div>` : ""}
+                        ${listing.reservation_duration ? `<div>${escapeHtml(listing.reservation_duration)}</div>` : ""}
+                        ${availabilityLabel ? `<div>${escapeHtml(availabilityLabel)}</div>` : ""}
+                        ${listing.in_out_policy ? `<div>${escapeHtml(listing.in_out_policy)}</div>` : ""}
+                        ${listing.notes ? `<div>${escapeHtml(listing.notes)}</div>` : ""}
+                      </div>
+                      <div class="tagRow">
+                        <span class="tag sourceBadge">SpotHero</span>
+                        ${listing.listing_id ? `<span class="tag">ID ${escapeHtml(listing.listing_id)}</span>` : ""}
+                      </div>
                     </div>
-                    <div class="listingMeta">
-                      ${listing.reservation_type ? `<div>${escapeHtml(listing.reservation_type)}</div>` : ""}
-                      ${listing.availability ? `<div>${escapeHtml(listing.availability)}</div>` : ""}
-                      ${listing.price_window ? `<div>Price window: ${escapeHtml(listing.price_window)}</div>` : ""}
-                      ${listing.reservation_duration ? `<div>${escapeHtml(listing.reservation_duration)}</div>` : ""}
-                      ${listing.in_out_policy ? `<div>${escapeHtml(listing.in_out_policy)}</div>` : ""}
-                      ${listing.notes ? `<div>${escapeHtml(listing.notes)}</div>` : ""}
-                    </div>
-                    <div class="tagRow">
-                      <span class="tag sourceBadge">SpotHero</span>
-                      ${listing.listing_id ? `<span class="tag">ID ${escapeHtml(listing.listing_id)}</span>` : ""}
-                    </div>
-                  </div>
-                `
+                  `;
+                }
               )
               .join("")
           : `<div class="empty">No SpotHero listings match the current filter.</div>`;
@@ -1181,6 +1300,10 @@
       downloadStubhubBtn.addEventListener("click", () => downloadExcel("stubhub"));
       downloadSpotheroBtn.addEventListener("click", () => downloadExcel("spothero"));
       downloadBothBtn.addEventListener("click", () => downloadExcel("both"));
+      themeToggleBtn.addEventListener("click", () => {
+        const currentTheme = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+        applyTheme(currentTheme === "light" ? "dark" : "light");
+      });
 
       searchInput.addEventListener("input", () => {
         clearTimeout(debounceTimer);
@@ -1244,6 +1367,8 @@
           renderSuggestions();
         }
       });
+
+      initializeTheme();
     </script>
   </body>
 </html>
