@@ -561,6 +561,7 @@
       let currentParkingQuery = "";
       let loadingPhaseIndex = 0;
       let progressiveRunId = 0;
+      let spotheroSearchRunId = 0;
       let currentSpotHeroDetails = null;
       let currentSpotHeroSuggestions = [];
 
@@ -588,6 +589,21 @@
         } else {
           applyTheme("dark");
         }
+      }
+
+      function setSpotHeroSearchLoading(value) {
+        spotheroSearchBtn.disabled = !!value;
+        spotheroSearchInput.classList.toggle("loading", !!value);
+        spotheroSearchBtn.textContent = value ? "Searching..." : "Search Comparison";
+      }
+
+      function scrollToSpotHeroSearch() {
+        const target = spotheroSearchInput.closest(".columnPanel") || spotheroSearchInput;
+        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        window.setTimeout(() => {
+          spotheroSearchInput.focus();
+          spotheroSearchInput.select();
+        }, 220);
       }
 
       function escapeHtml(str) {
@@ -892,6 +908,7 @@
             const venueName = normalizeVenueForSpotHero(button.getAttribute("data-use-venue"));
             spotheroSearchInput.value = venueName;
             await copyText(venueName);
+            scrollToSpotHeroSearch();
             loadSpotHeroByQuery(venueName);
           });
         });
@@ -1204,8 +1221,11 @@
           renderSpotHeroState(`<div class="empty">Paste a StubHub venue name into the SpotHero search box first.</div>`);
           return;
         }
+        spotheroSearchRunId += 1;
+        const runId = spotheroSearchRunId;
         currentSpotHeroDetails = null;
         currentSpotHeroSuggestions = [];
+        setSpotHeroSearchLoading(true);
         renderSpotHeroState(`
           <section class="loadingPanel">
             <h2 class="loadingTitle">Searching SpotHero</h2>
@@ -1221,6 +1241,9 @@
             body: JSON.stringify({ query: trimmed, title: trimmed, venue_name: trimmed, source: "manual_spothero" }),
           });
           const data = await resp.json();
+          if (runId !== spotheroSearchRunId) {
+            return;
+          }
           if (!data || data.success !== true) {
             throw new Error((data && data.error) || "SpotHero lookup failed");
           }
@@ -1228,9 +1251,16 @@
           currentSpotHeroSuggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
           renderSpotHeroResults();
         } catch (error) {
+          if (runId !== spotheroSearchRunId) {
+            return;
+          }
           currentSpotHeroDetails = null;
           currentSpotHeroSuggestions = [];
           renderSpotHeroState(`<div class="empty">SpotHero lookup failed. ${escapeHtml(String(error))}</div>`);
+        } finally {
+          if (runId === spotheroSearchRunId) {
+            setSpotHeroSearchLoading(false);
+          }
         }
       }
 
