@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import os
 import re
 import json
 import shutil
@@ -24,6 +25,90 @@ from loguru import logger
 class StubHubParkingScraper(TicketingPlaywrightBase):
     handler: str = "stubhub-parking"
     _debug_dir: Path | None = None
+    _inventory_expand_budget_seconds = 12.0
+    _inventory_expand_rounds = 10
+    _default_listing_wait_timeout_ms = 6000
+    _quick_listing_wait_timeout_ms = 1200
+    _empty_inventory_patterns = [
+        re.compile(r"sorry,\s+there are no tickets available for this event", flags=re.IGNORECASE),
+        re.compile(r"notify me when tickets are available", flags=re.IGNORECASE),
+        re.compile(r"no tickets available for this event", flags=re.IGNORECASE),
+        re.compile(r"see other .* events", flags=re.IGNORECASE),
+    ]
+
+    @classmethod
+    def _contains_empty_inventory_text(cls, value: str | None) -> bool:
+        return bool(cls._detect_empty_inventory_text(value))
+
+    @staticmethod
+    def _row_text_blob(row: dict) -> str:
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        pieces = [
+            row.get("lot_name"),
+            row.get("availability"),
+            row.get("details"),
+            details.get("title"),
+            details.get("availability"),
+            details.get("notes"),
+            details.get("description"),
+        ]
+        return " ".join(str(piece or "").strip() for piece in pieces if piece).strip()
+
+    @staticmethod
+    def _row_source(row: dict) -> str:
+        return str(row.get("_source") or "").strip().lower()
+
+    @classmethod
+    def _is_placeholder_listing_row(cls, row: dict) -> bool:
+        source = cls._row_source(row)
+        text_blob = cls._row_text_blob(row)
+        if cls._contains_empty_inventory_text(text_blob):
+            return True
+
+        listing_id = cls._listing_identifier(row)
+        lot_name = str(row.get("lot_name") or "").strip()
+        availability = str(row.get("availability") or "").strip()
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        price_text = (
+            str(row.get("price") or "").strip()
+            or str(details.get("price_incl_fees") or "").strip()
+        )
+        has_price = bool(price_text)
+        has_availability = bool(availability or details.get("availability"))
+        generic_lot = cls._is_generic_lot_name(lot_name)
+        dom_like_source = source.startswith("dom")
+
+        if dom_like_source:
+            return False
+        if not has_price:
+            return True
+        if not listing_id and generic_lot and not has_availability:
+            return True
+        if listing_id and generic_lot and not has_availability and source in {"embedded_html", "payload_json", "state"}:
+            return True
+        return False
+
+    @classmethod
+    def _has_real_inventory_signal(cls, row: dict) -> bool:
+        if cls._is_placeholder_listing_row(row):
+            return False
+        lot_name = str(row.get("lot_name") or "").strip()
+        availability = str(row.get("availability") or "").strip()
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        listing_id = cls._listing_identifier(row)
+        has_price = bool(
+            str(row.get("price") or "").strip()
+            or str(details.get("price_incl_fees") or "").strip()
+        )
+        if not has_price:
+            return False
+        if availability or details.get("availability"):
+            return True
+        if listing_id and lot_name and not cls._is_generic_lot_name(lot_name):
+            return True
+        if cls._row_source(row).startswith("dom") and lot_name:
+            return True
+        return False
 
     @staticmethod
     def _listing_identifier(row: dict) -> str | None:
@@ -126,10 +211,13 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         if not rows:
             return rows
 
+        rows = [row for row in rows if not StubHubParkingScraper._is_placeholder_listing_row(row)]
+        if not rows:
+            return []
+
         real_rows = [
             row for row in rows
-            if not StubHubParkingScraper._is_generic_lot_name(row.get("lot_name"))
-            and (row.get("availability") or (row.get("listing_details") or {}).get("availability"))
+            if StubHubParkingScraper._has_real_inventory_signal(row)
         ]
         if not real_rows:
             return rows
@@ -313,13 +401,25 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 continue
         return max_count
 
+    @classmethod
+    def _detect_empty_inventory_text(cls, text: str | None) -> str | None:
+        body_text = (text or "").strip()
+        if not body_text:
+            return None
+        normalized = re.sub(r"\s+", " ", body_text)
+        for pattern in cls._empty_inventory_patterns:
+            match = pattern.search(normalized)
+            if match:
+                return match.group(0)
+        return None
+
     async def _load_all_listing_inventory(self) -> None:
-        max_duration_seconds = 35.0
+        max_duration_seconds = self._inventory_expand_budget_seconds
         started_at = time.perf_counter()
         stable_rounds = 0
         last_visible_count = -1
 
-        for _ in range(24):
+        for _ in range(self._inventory_expand_rounds):
             if time.perf_counter() - started_at >= max_duration_seconds:
                 logger.info(
                     f"[Scraper] Inventory expansion budget exhausted after {max_duration_seconds:.1f}s; proceeding with extraction."
@@ -421,7 +521,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             await asyncio.sleep(1)
         return False
 
-    async def _extract_passes_from_dom(self) -> list[dict]:
+    async def _extract_passes_from_dom(
+        self,
+        *,
+        wait_timeout_ms: int | None = None,
+        capture_debug_screenshot: bool = False,
+    ) -> list[dict]:
         async def _extract_from_context(ctx) -> list[dict]:
             selectors = [
                 'div[role="button"].sc-194s59m-4',
@@ -541,6 +646,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "currency": currency or None,
                         "availability": availability,
                         "listing_id": listing_id,
+                        "_source": "dom",
                         "listing_details": {
                             "title": lot_name,
                             "price_incl_fees": price_text or f"${price}",
@@ -554,19 +660,18 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
         # First, wait for dynamic content
         logger.info(f"[Scraper] Waiting for listings on {self.page.url}")
-        is_ready = await self._wait_for_listings()
+        is_ready = await self._wait_for_listings(timeout_ms=wait_timeout_ms or self._default_listing_wait_timeout_ms)
         logger.info(f"[Scraper] Listings ready status: {is_ready}")
-        
-        # Capture screenshot for debugging
-        debug_base = self._debug_dir or STORAGE_DIR
-        debug_ss_path = debug_base / f"debug_phase2_{int(asyncio.get_event_loop().time())}.png"
-        try:
-            await self.page.screenshot(path=str(debug_ss_path))
-            logger.info(f"[Scraper] Debug screenshot saved to {debug_ss_path}")
-        except Exception as e:
-            logger.warning(f"[Scraper] Failed to save debug screenshot: {e}")
 
-        await self.human_delay()
+        if capture_debug_screenshot:
+            debug_base = self._debug_dir or STORAGE_DIR
+            debug_ss_path = debug_base / f"debug_phase2_{int(asyncio.get_event_loop().time())}.png"
+            try:
+                await self.page.screenshot(path=str(debug_ss_path))
+                logger.info(f"[Scraper] Debug screenshot saved to {debug_ss_path}")
+            except Exception as e:
+                logger.warning(f"[Scraper] Failed to save debug screenshot: {e}")
+
         passes = await _extract_from_context(self.page)
         logger.info(f"[Scraper] DOM extraction found {len(passes or [])} passes")
         if passes:
@@ -656,6 +761,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "currency": currency_code or None,
                         "availability": availability,
                         "listing_id": listing_id,
+                        "_source": "dom_panel",
                         "details": text if len(text) < 500 else text[:500] + "...",
                     }
                 )
@@ -714,6 +820,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "currency": currency_code or None,
                     "availability": availability,
                     "listing_id": listing_id,
+                    "_source": "dom_fuzzy",
                     "details": text if len(text) < 500 else text[:500] + "...",
                 }
             )
@@ -1033,6 +1140,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     return
 
             try:
+                capture_debug_screenshot = os.getenv("STUBHUB_PARKING_DEBUG_SCREENSHOT", "").strip().lower() in {"1", "true", "yes", "on"}
+
                 def _handle_response(resp):
                     task = asyncio.create_task(_capture_response(resp))
                     response_tasks.add(task)
@@ -1042,32 +1151,78 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 self.page.on("request", _capture_request)
                 logger.info(f"[Scraper] Navigating to {url}")
                 try:
-                    await self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
                     logger.warning(f"[Scraper] Initial goto failed/timed out: {e}")
-                    await self.page.goto(url, wait_until="commit", timeout=45000)
+                    await self.page.goto(url, wait_until="commit", timeout=30000)
 
                 logger.info(f"[Scraper] Navigation complete. Waiting for stabilization...")
-                await self.human_delay()
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.75)
+
+                body_text = ""
+                empty_inventory_reason = None
+                try:
+                    body_text = await self.page.evaluate("""() => document.body.innerText || ''""")
+                    empty_inventory_reason = self._detect_empty_inventory_text(body_text)
+                except Exception:
+                    body_text = ""
+
+                if empty_inventory_reason:
+                    probe = {
+                        "attempt": label,
+                        "url": self.page.url,
+                        "title": (await self.page.title()),
+                        "captured_payloads": 0,
+                        "captured_urls": [],
+                        "captured_request_payloads": 0,
+                        "captured_request_urls": [],
+                        "dom_passes": 0,
+                        "state_passes": 0,
+                        "embedded_passes": 0,
+                        "xhr_passes": 0,
+                        "merged_passes": 0,
+                        "empty_inventory": True,
+                        "empty_inventory_reason": empty_inventory_reason,
+                    }
+                    logger.info(f"[Scraper] Empty inventory page detected for {self.page.url}: {empty_inventory_reason}")
+                    return [], probe
+
+                visible_before_expand = 0
+                has_listing_count = bool(re.search(r"\b\d+\s+listings\b", body_text, flags=re.IGNORECASE))
+                try:
+                    visible_before_expand = await self._count_visible_listing_nodes()
+                except Exception:
+                    visible_before_expand = 0
+
+                state_passes = await self._extract_passes_from_state()
+                embedded_passes = await self._extract_passes_from_embedded_json()
+
+                should_expand_inventory = not (visible_before_expand >= 3 or state_passes or embedded_passes)
+                dom_wait_timeout_ms = (
+                    self._quick_listing_wait_timeout_ms
+                    if (visible_before_expand >= 1 or state_passes or embedded_passes)
+                    else self._default_listing_wait_timeout_ms
+                )
 
                 logger.info("[Scraper] Expanding and scrolling listing inventory...")
                 try:
-                    body_text = await self.page.evaluate("""() => document.body.innerText || ''""")
-                    visible_before_expand = await self._count_visible_listing_nodes()
-                    has_listing_count = bool(re.search(r"\b\d+\s+listings\b", body_text, flags=re.IGNORECASE))
                     if has_listing_count and visible_before_expand >= 20:
                         logger.info(
                             f"[Scraper] Detected virtualized listing pane ({visible_before_expand} visible cards); skipping pre-scroll expansion."
                         )
-                    else:
+                    elif should_expand_inventory:
                         await self._load_all_listing_inventory()
+                    else:
+                        logger.info(
+                            f"[Scraper] Skipping inventory expansion; visible_nodes={visible_before_expand}, state_passes={len(state_passes)}, embedded_passes={len(embedded_passes)}"
+                        )
                 except Exception as exc:
                     logger.warning(f"[Scraper] Inventory expansion failed; continuing with partial page state: {exc}")
 
-                dom_passes = await self._extract_passes_from_dom()
-                state_passes = await self._extract_passes_from_state()
-                embedded_passes = await self._extract_passes_from_embedded_json()
+                dom_passes = await self._extract_passes_from_dom(
+                    wait_timeout_ms=dom_wait_timeout_ms,
+                    capture_debug_screenshot=capture_debug_screenshot,
+                )
 
                 if response_tasks:
                     await asyncio.gather(*list(response_tasks), return_exceptions=True)
@@ -1082,6 +1237,38 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
                 passes = self._filter_telemetry_rows(passes)
 
+                strong_passes = [row for row in passes if self._has_real_inventory_signal(row)]
+                visible_after_extract = 0
+                try:
+                    visible_after_extract = await self._count_visible_listing_nodes()
+                except Exception:
+                    visible_after_extract = 0
+
+                if not strong_passes and visible_after_extract == 0:
+                    probe = {
+                        "attempt": label,
+                        "url": self.page.url,
+                        "title": (await self.page.title()),
+                        "captured_payloads": len(captured_payloads),
+                        "captured_urls": captured_urls[:5],
+                        "captured_request_payloads": len(captured_request_payloads),
+                        "captured_request_urls": captured_request_urls[:5],
+                        "dom_passes": len(dom_passes),
+                        "state_passes": len(state_passes),
+                        "embedded_passes": len(embedded_passes),
+                        "xhr_passes": len(xhr_passes),
+                        "merged_passes": 0,
+                        "empty_inventory": True,
+                        "empty_inventory_reason": "no_real_listing_signals",
+                    }
+                    logger.info(
+                        f"[Scraper] No real listing signals detected for {self.page.url}; "
+                        f"visible_nodes={visible_after_extract}, raw_passes={len(passes)}"
+                    )
+                    return [], probe
+
+                passes = strong_passes or passes
+
                 probe = {
                     "attempt": label,
                     "url": self.page.url,
@@ -1095,6 +1282,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "embedded_passes": len(embedded_passes),
                     "xhr_passes": len(xhr_passes),
                     "merged_passes": len(passes),
+                    "empty_inventory": False,
                 }
                 return passes, probe
             finally:

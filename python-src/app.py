@@ -137,6 +137,16 @@ def _score_live_match(query: str, *parts: str) -> int:
     return 0
 
 
+async def _gather_limited(coroutines: list, limit: int = 3) -> list:
+    semaphore = asyncio.Semaphore(max(1, int(limit or 1)))
+
+    async def _runner(coro):
+        async with semaphore:
+            return await coro
+
+    return await asyncio.gather(*[_runner(coro) for coro in coroutines], return_exceptions=True)
+
+
 async def _fetch_spothero_cities() -> list[dict]:
     cached = _live_cache_get("spothero:cities", 1800)
     if isinstance(cached, list):
@@ -574,6 +584,10 @@ async def _fetch_stubhub_search_index(query: str, page: int = 0) -> dict:
     if not search_query:
         raise ValueError("query is required")
     page = max(0, int(page or 0))
+    cache_key = f"stubhub:search:{search_query.lower()}:{page}"
+    cached = _live_cache_get(cache_key, 120)
+    if isinstance(cached, dict):
+        return cached
 
     async with httpx.AsyncClient(
         follow_redirects=True,
@@ -595,15 +609,20 @@ async def _fetch_stubhub_search_index(query: str, page: int = 0) -> dict:
         raise ValueError("StubHub search response did not include index-data JSON.")
 
     try:
-        return json.loads(html.unescape(match.group(1)))
+        payload = json.loads(html.unescape(match.group(1)))
     except Exception as exc:
         raise ValueError("Failed to parse StubHub search results.") from exc
+    return _live_cache_set(cache_key, payload)
 
 
 async def _fetch_stubhub_index_from_url(url: str, page: int = 0) -> dict:
     target_url = _normalize_stubhub_url(url)
     if not target_url:
         raise ValueError("valid StubHub url is required")
+    cache_key = f"stubhub:url:{target_url}:{max(0, int(page or 0))}"
+    cached = _live_cache_get(cache_key, 120)
+    if isinstance(cached, dict):
+        return cached
 
     parts = urlsplit(target_url)
     params = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -630,9 +649,10 @@ async def _fetch_stubhub_index_from_url(url: str, page: int = 0) -> dict:
         raise ValueError("StubHub page did not include index-data JSON.")
 
     try:
-        return json.loads(html.unescape(match.group(1)))
+        payload = json.loads(html.unescape(match.group(1)))
     except Exception as exc:
         raise ValueError("Failed to parse StubHub page index-data.") from exc
+    return _live_cache_set(cache_key, payload)
 
 
 def _stubhub_search_grid_items(index_data: dict) -> list[dict]:
@@ -675,11 +695,29 @@ def _stubhub_item_to_selection(item: dict, source: str) -> dict:
 
 
 async def _fetch_stubhub_search_grid_items_paginated(query: str, max_pages: int = 5) -> list[dict]:
+    max_pages = max(1, int(max_pages or 1))
     seen: set[str] = set()
     combined: list[dict] = []
+    try:
+        first_page = await _fetch_stubhub_search_index(query, page=0)
+    except Exception:
+        return []
 
-    for page in range(max(1, max_pages)):
-        index_data = await _fetch_stubhub_search_index(query, page=page)
+    first_items = _stubhub_search_grid_items(first_page)
+    if not first_items:
+        return []
+
+    page_results = [first_page]
+    if len(first_items) >= 20 and max_pages > 1:
+        remaining = await _gather_limited(
+            [_fetch_stubhub_search_index(query, page=page) for page in range(1, max_pages)],
+            limit=2,
+        )
+        page_results.extend(remaining)
+
+    for index_data in page_results:
+        if isinstance(index_data, Exception):
+            continue
         page_items = _stubhub_search_grid_items(index_data)
         if not page_items:
             break
@@ -701,14 +739,29 @@ async def _fetch_stubhub_search_grid_items_paginated(query: str, max_pages: int 
 
 
 async def _fetch_stubhub_schedule_items(selection_url: str, max_pages: int = 6) -> list[dict]:
+    max_pages = max(1, int(max_pages or 1))
     seen: set[str] = set()
     combined: list[dict] = []
+    try:
+        first_page = await _fetch_stubhub_index_from_url(selection_url, page=0)
+    except Exception:
+        first_page = None
 
-    for page in range(max(1, max_pages)):
-        try:
-            index_data = await _fetch_stubhub_index_from_url(selection_url, page=page)
-        except Exception:
-            break
+    page_results: list = []
+    if first_page is not None:
+        first_items = _stubhub_search_grid_items(first_page)
+        if first_items:
+            page_results.append(first_page)
+            if len(first_items) >= 20 and max_pages > 1:
+                remaining = await _gather_limited(
+                    [_fetch_stubhub_index_from_url(selection_url, page=page) for page in range(1, max_pages)],
+                    limit=2,
+                )
+                page_results.extend(remaining)
+
+    for index_data in page_results:
+        if isinstance(index_data, Exception):
+            continue
         page_items = _stubhub_search_grid_items(index_data)
         if not page_items:
             break
@@ -906,12 +959,16 @@ async def _fetch_expanded_schedule_items_from_queries(title: str, max_events: in
         for month in month_tokens:
             queries.append(f"{clean_title} {month} {year}")
 
+    query_limit = min(len(queries), max(3, min(6, max_events // 12 or 1)))
+    query_results = await _gather_limited(
+        [_fetch_stubhub_search_grid_items_paginated(query, max_pages=2) for query in queries[:query_limit]],
+        limit=3,
+    )
+
     seen: set[str] = set()
     events: list[dict] = []
-    for query in queries:
-        try:
-            items = await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
-        except Exception:
+    for items in query_results:
+        if isinstance(items, Exception):
             continue
         for item in items:
             if item.get("isParkingEvent"):
@@ -939,12 +996,16 @@ async def _fetch_expanded_parking_candidates_from_queries(title: str, max_events
         for month in month_tokens:
             queries.append(f"parking passes only {clean_title} {month} {year}")
 
+    query_limit = min(len(queries), max(3, min(6, max_events // 12 or 1)))
+    query_results = await _gather_limited(
+        [_fetch_stubhub_search_grid_items_paginated(query, max_pages=2) for query in queries[:query_limit]],
+        limit=3,
+    )
+
     seen: set[str] = set()
     parking_events: list[dict] = []
-    for query in queries:
-        try:
-            items = await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
-        except Exception:
+    for items in query_results:
+        if isinstance(items, Exception):
             continue
         for item in items:
             if not item.get("isParkingEvent"):
@@ -960,6 +1021,41 @@ async def _fetch_expanded_parking_candidates_from_queries(title: str, max_events
     return parking_events
 
 
+def _rank_client_search_parking_candidates(candidates: list[dict], payload: dict, max_events: int) -> list[dict]:
+    if not candidates:
+        return []
+
+    event_item = {
+        "title": payload.get("title") or payload.get("query") or "",
+        "name": payload.get("title") or payload.get("query") or "",
+        "formattedDate": payload.get("date") or "",
+        "date": payload.get("date") or "",
+        "formattedVenueLocation": payload.get("location") or "",
+        "location": payload.get("location") or "",
+        "venueName": payload.get("venue_name") or "",
+        "venue_name": payload.get("venue_name") or "",
+    }
+
+    scored: list[tuple[int, int, dict]] = []
+    seen: set[str] = set()
+    for index, candidate in enumerate(candidates):
+        canonical = _canonical_stubhub_url(candidate.get("canonical_url") or candidate.get("url"))
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        normalized_candidate = dict(candidate)
+        normalized_candidate["canonical_url"] = canonical
+        normalized_candidate["url"] = candidate.get("url") or canonical
+        score = _parking_candidate_score(normalized_candidate, event_item)
+        scored.append((score, index, normalized_candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    strong_matches = [candidate for score, _, candidate in scored if score > 0]
+    if strong_matches:
+        return strong_matches[:max_events]
+    return [candidate for _, _, candidate in scored[:max_events]]
+
+
 async def _resolve_client_search_parking_candidates(payload: dict, max_events: int) -> list[dict]:
     selection_type = str(payload.get("selection_type") or "").lower()
     selection_url = payload.get("canonical_url") or payload.get("url")
@@ -967,28 +1063,59 @@ async def _resolve_client_search_parking_candidates(payload: dict, max_events: i
 
     if selection_type not in {"performer", "grouping", "category", "venue"} or not selection_url:
         parking_query = _build_parking_query_from_selection(payload)
-        return [
+        direct_candidates = [
             _stubhub_item_to_selection(item, source="event")
             for item in await _fetch_stubhub_search_grid_items_paginated(
                 parking_query,
-                max_pages=max(3, min(8, (max_events + 19) // 20 + 2)),
+                max_pages=max(2, min(4, (max_events + 19) // 20 + 1)),
             )
             if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
-        ][:max_events]
+        ]
+        return _rank_client_search_parking_candidates(direct_candidates, payload, max_events)
+
+    parking_query = _build_parking_query_from_selection(payload)
+    direct_candidates = [
+        _stubhub_item_to_selection(item, source="event")
+        for item in await _fetch_stubhub_search_grid_items_paginated(parking_query, max_pages=2)
+        if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
+    ]
+    ranked_direct = _rank_client_search_parking_candidates(direct_candidates, payload, max_events)
+    if ranked_direct:
+        strong_direct_matches = [
+            candidate
+            for candidate in ranked_direct
+            if _parking_candidate_score(
+                candidate,
+                {
+                    "title": payload.get("title") or payload.get("query") or "",
+                    "name": payload.get("title") or payload.get("query") or "",
+                    "formattedDate": payload.get("date") or "",
+                    "date": payload.get("date") or "",
+                    "formattedVenueLocation": payload.get("location") or "",
+                    "location": payload.get("location") or "",
+                    "venueName": payload.get("venue_name") or "",
+                    "venue_name": payload.get("venue_name") or "",
+                },
+            ) >= 9
+        ]
+        if strong_direct_matches:
+            return ranked_direct[:max_events]
 
     expanded = await _fetch_expanded_parking_candidates_from_queries(
         payload.get("title") or payload.get("query") or "",
         max_events=max(120, max_events * 2),
     )
-    if expanded:
-        return expanded[:max_events]
+    combined_candidates = [*direct_candidates, *expanded]
+    ranked_combined = _rank_client_search_parking_candidates(combined_candidates, payload, max_events)
+    if ranked_combined:
+        return ranked_combined[:max_events]
 
-    parking_query = _build_parking_query_from_selection(payload)
-    return [
+    fallback_candidates = [
         _stubhub_item_to_selection(item, source="event")
-        for item in await _fetch_stubhub_search_grid_items_paginated(parking_query, max_pages=8)
+        for item in await _fetch_stubhub_search_grid_items_paginated(parking_query, max_pages=4)
         if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
-    ][:max_events]
+    ]
+    return _rank_client_search_parking_candidates(fallback_candidates, payload, max_events)
 
 
 def _stubhub_selection_type(url: str | None) -> str:
@@ -1183,6 +1310,26 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
     return results
 
 
+def _client_search_scrape_label(card: dict, errors: list[dict] | None = None) -> str:
+    listing_count = int(card.get("listing_count") or 0)
+    if listing_count > 0:
+        return f"Loaded {listing_count} listings"
+
+    error_rows = errors or []
+    parking_url = _canonical_stubhub_url(card.get("parking_url"))
+    for error in error_rows:
+        error_url = _canonical_stubhub_url(error.get("parking_url") or error.get("event_url"))
+        if parking_url and error_url and parking_url != error_url:
+            continue
+        probe = error.get("probe") if isinstance(error.get("probe"), dict) else {}
+        if probe.get("empty_inventory"):
+            return "No listings available"
+        if str(error.get("error") or "").strip() == "No parking listings extracted":
+            return "No listings available"
+
+    return "No listings available"
+
+
 def _client_search_payload_from_request_payload(payload: dict) -> dict:
     return {
         "title": (payload.get("title") or payload.get("query") or "").strip(),
@@ -1194,7 +1341,26 @@ def _client_search_payload_from_request_payload(payload: dict) -> dict:
         "relationship_count": payload.get("relationship_count"),
         "location": payload.get("location") or "",
         "venue_name": payload.get("venue_name") or payload.get("venueName") or "",
+        "date": payload.get("date") or payload.get("formattedDate") or "",
+        "time": payload.get("time") or payload.get("formattedTime") or "",
+        "day_of_week": payload.get("day_of_week") or payload.get("dayOfWeek") or "",
     }
+
+
+def _client_search_cache_key(prefix: str, payload: dict, **extra) -> str:
+    normalized = {
+        "title": str(payload.get("title") or payload.get("query") or "").strip().lower(),
+        "query": str(payload.get("query") or payload.get("title") or "").strip().lower(),
+        "source": str(payload.get("source") or "").strip().lower(),
+        "selection_type": str(payload.get("selection_type") or "").strip().lower(),
+        "canonical_url": str(payload.get("canonical_url") or payload.get("url") or "").strip().lower(),
+        "url": str(payload.get("url") or payload.get("canonical_url") or "").strip().lower(),
+        "location": str(payload.get("location") or "").strip().lower(),
+        "venue_name": str(payload.get("venue_name") or payload.get("venueName") or "").strip().lower(),
+    }
+    normalized.update(extra)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return f"{prefix}:{encoded}"
 
 
 def _build_spothero_queries_from_selection(payload: dict) -> list[str]:
@@ -1234,8 +1400,14 @@ async def _pick_best_spothero_suggestion(payload: dict) -> tuple[dict | None, li
     title = str(payload.get("title") or payload.get("query") or "").strip()
     location = str(payload.get("location") or "").strip()
 
-    for query in query_candidates:
-        suggestions = await _live_destination_suggestions(query)
+    query_results = await _gather_limited(
+        [_live_destination_suggestions(query) for query in query_candidates],
+        limit=2,
+    )
+
+    for query, suggestions in zip(query_candidates, query_results):
+        if isinstance(suggestions, Exception):
+            continue
         for suggestion in suggestions:
             enriched = dict(suggestion)
             composite_score = (
@@ -1529,6 +1701,124 @@ async def _fetch_live_spothero_destination_details(destination_id: int, destinat
     }
 
 
+async def _load_client_search_event_card(search_item: dict, *, ttl_seconds: int = 300) -> dict:
+    parking_url = _canonical_stubhub_url(search_item.get("parking_url") or search_item.get("url") or search_item.get("canonical_url"))
+    if not parking_url:
+        raise ValueError("parking_url is required")
+
+    cache_key = f"client-search:event-details:{parking_url}"
+    cached = _live_cache_get(cache_key, ttl_seconds)
+    if isinstance(cached, dict):
+        return cached
+
+    phase2_result = await ticketing_phase2(
+        parking_urls=parking_url,
+        limit=1,
+        batch_size=1,
+        export_json=False,
+        persist=False,
+        alert_on_failures=False,
+    )
+    if isinstance(phase2_result, JSONResponse):
+        raise ValueError("Listing scrape failed")
+
+    grouped_results = _group_client_search_results([search_item], phase2_result.get("data") or [])
+    card = grouped_results[0] if grouped_results else _group_client_search_results([search_item], [])[0]
+    card["scrape_state"] = "done"
+    card["scrape_label"] = _client_search_scrape_label(card, phase2_result.get("errors") or [])
+    response_payload = {
+        "success": True,
+        "parking_url": parking_url,
+        "card": card,
+        "errors": phase2_result.get("errors") or [],
+    }
+    return _live_cache_set(cache_key, response_payload)
+
+
+async def _load_client_search_event_cards_batch(search_items: list[dict], *, ttl_seconds: int = 300, batch_size: int = 2) -> dict:
+    normalized_items: list[dict] = []
+    cached_cards: dict[str, dict] = {}
+    uncached_items: list[dict] = []
+
+    for raw_item in search_items or []:
+        if not isinstance(raw_item, dict):
+            continue
+        parking_url = _canonical_stubhub_url(raw_item.get("parking_url") or raw_item.get("url") or raw_item.get("canonical_url"))
+        if not parking_url:
+            continue
+        normalized_item = dict(raw_item)
+        normalized_item["parking_url"] = parking_url
+        normalized_items.append(normalized_item)
+        cache_key = f"client-search:event-details:{parking_url}"
+        cached = _live_cache_get(cache_key, ttl_seconds)
+        if isinstance(cached, dict):
+            cached_cards[parking_url] = cached
+        else:
+            uncached_items.append(normalized_item)
+
+    if uncached_items:
+        try:
+            parking_urls_csv = ",".join(item["parking_url"] for item in uncached_items)
+            phase2_result = await ticketing_phase2(
+                parking_urls=parking_urls_csv,
+                limit=max(1, len(uncached_items)),
+                batch_size=max(1, min(int(batch_size or 2), len(uncached_items))),
+                export_json=False,
+                persist=False,
+                alert_on_failures=False,
+            )
+            if isinstance(phase2_result, JSONResponse):
+                raise ValueError("Batch listing scrape failed")
+
+            grouped_results = _group_client_search_results(uncached_items, phase2_result.get("data") or [])
+            grouped_by_url = {
+                _canonical_stubhub_url(card.get("parking_url")): card
+                for card in grouped_results
+                if _canonical_stubhub_url(card.get("parking_url"))
+            }
+
+            for item in uncached_items:
+                parking_url = item["parking_url"]
+                card = grouped_by_url.get(parking_url) or _group_client_search_results([item], [])[0]
+                matching_errors = [
+                    error
+                    for error in (phase2_result.get("errors") or [])
+                    if _canonical_stubhub_url(error.get("parking_url") or error.get("event_url")) == parking_url
+                ]
+                card["scrape_state"] = "done"
+                card["scrape_label"] = _client_search_scrape_label(card, matching_errors)
+                payload = {
+                    "success": True,
+                    "parking_url": parking_url,
+                    "card": card,
+                    "errors": matching_errors,
+                }
+                cached_cards[parking_url] = _live_cache_set(f"client-search:event-details:{parking_url}", payload)
+        except Exception:
+            fallback_results = await _gather_limited(
+                [_load_client_search_event_card(item, ttl_seconds=ttl_seconds) for item in uncached_items],
+                limit=max(1, min(int(batch_size or 2), len(uncached_items))),
+            )
+            for item, result in zip(uncached_items, fallback_results):
+                parking_url = item["parking_url"]
+                if isinstance(result, Exception):
+                    continue
+                if isinstance(result, dict):
+                    cached_cards[parking_url] = result
+
+    ordered_cards = []
+    for item in normalized_items:
+        parking_url = item["parking_url"]
+        payload = cached_cards.get(parking_url)
+        if payload:
+            ordered_cards.append(payload)
+
+    return {
+        "success": True,
+        "cards": ordered_cards,
+    }
+
+
 @app.get("/ui/parking-links", response_class=HTMLResponse)
 async def ui_parking_links():
     page = UI_DIR / "parking_links.html"
@@ -1582,14 +1872,19 @@ async def ui_client_search_spothero(request: Request):
 
     try:
         selection_payload = _client_search_payload_from_request_payload(payload)
+        cache_key = _client_search_cache_key("client-search:spothero", selection_payload)
+        cached = _live_cache_get(cache_key, 300)
+        if isinstance(cached, dict):
+            return cached
         best, suggestions, matched_query = await _pick_best_spothero_suggestion(selection_payload)
         if not best or not best.get("destination_id") or not best.get("path"):
-            return {
+            response_payload = {
                 "success": True,
                 "matched_query": matched_query,
                 "details": None,
                 "suggestions": suggestions,
             }
+            return _live_cache_set(cache_key, response_payload)
 
         details = await _fetch_live_spothero_destination_details(
             int(best["destination_id"]),
@@ -1605,12 +1900,13 @@ async def ui_client_search_spothero(request: Request):
             "destination_page_url": best.get("destination_page_url"),
             "search_url": best.get("search_url"),
         }
-        return {
+        response_payload = {
             "success": True,
             "matched_query": details.get("matched_query") or matched_query,
             "details": details,
             "suggestions": suggestions,
         }
+        return _live_cache_set(cache_key, response_payload)
     except Exception as exc:
         logger.error(f"Client search SpotHero lookup failed: {exc}")
         return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
@@ -1635,10 +1931,14 @@ async def ui_client_search_run(request: Request):
 
     try:
         selection_payload = _client_search_payload_from_request_payload(payload)
+        cache_key = _client_search_cache_key("client-search:run", selection_payload, max_events=max_events)
+        cached = _live_cache_get(cache_key, 180)
+        if isinstance(cached, dict):
+            return cached
         parking_query = _build_parking_query_from_selection(selection_payload)
         parking_candidates = await _resolve_client_search_parking_candidates(selection_payload, max_events=max_events)
         if not parking_candidates:
-            return {
+            response_payload = {
                 "success": True,
                 "query": (payload.get("query") or "").strip(),
                 "parking_query": parking_query,
@@ -1647,9 +1947,26 @@ async def ui_client_search_run(request: Request):
                 "data": [],
                 "errors": [],
             }
+            return _live_cache_set(cache_key, response_payload)
 
         grouped_results = _group_client_search_results(parking_candidates, [])
-        return {
+        preload_count = min(2, len(grouped_results))
+        if preload_count > 0:
+            preloaded = await _gather_limited(
+                [_load_client_search_event_card(card) for card in grouped_results[:preload_count]],
+                limit=2,
+            )
+            preloaded_cards = {}
+            for item in preloaded:
+                if isinstance(item, Exception):
+                    continue
+                card = item.get("card") if isinstance(item, dict) else None
+                if isinstance(card, dict) and card.get("parking_url"):
+                    preloaded_cards[card["parking_url"]] = card
+            if preloaded_cards:
+                grouped_results = [preloaded_cards.get(card.get("parking_url"), card) for card in grouped_results]
+
+        response_payload = {
             "success": True,
             "query": (payload.get("query") or "").strip(),
             "selection_title": (payload.get("title") or payload.get("query") or "").strip(),
@@ -1659,6 +1976,7 @@ async def ui_client_search_run(request: Request):
             "data": grouped_results,
             "errors": [],
         }
+        return _live_cache_set(cache_key, response_payload)
     except Exception as exc:
         logger.error(f"Client search run failed: {exc}")
         return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
@@ -1692,28 +2010,32 @@ async def ui_client_search_event_details(request: Request):
     }
 
     try:
-        phase2_result = await ticketing_phase2(
-            parking_urls=parking_url,
-            limit=1,
-            batch_size=1,
-            export_json=False,
-            persist=False,
-            alert_on_failures=False,
-        )
-        if isinstance(phase2_result, JSONResponse):
-            return phase2_result
-
-        grouped_results = _group_client_search_results([search_item], phase2_result.get("data") or [])
-        card = grouped_results[0] if grouped_results else _group_client_search_results([search_item], [])[0]
-        return {
-            "success": True,
-            "parking_url": parking_url,
-            "card": card,
-            "errors": phase2_result.get("errors") or [],
-        }
+        return await _load_client_search_event_card(search_item)
     except Exception as exc:
         logger.error(f"Client search event-details failed for {parking_url}: {exc}")
         return JSONResponse({"success": False, "error": str(exc), "parking_url": parking_url}, status_code=502)
+
+
+@app.post("/ticketing/ui/client-search/event-details-batch")
+async def ui_client_search_event_details_batch(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    payload: dict = {}
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    items = payload.get("items") or []
+    if not isinstance(items, list) or not items:
+        return JSONResponse({"success": False, "error": "items is required"}, status_code=400)
+
+    try:
+        result = await _load_client_search_event_cards_batch(items, batch_size=min(2, len(items)))
+        return result
+    except Exception as exc:
+        logger.error(f"Client search event-details-batch failed: {exc}")
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
 
 
 @app.post("/ui/parking-links/run")
@@ -3336,12 +3658,12 @@ async def _run_parking_for_event(event_row: dict) -> list[dict]:
         try:
             passes = await asyncio.wait_for(
                 instance.scrape_parking_details(event_obj),
-                timeout=120,
+                timeout=45,
             )
         except asyncio.TimeoutError as exc:
             probe = getattr(instance, "_last_probe", {}) or {}
             raise TimeoutError(
-                f"parking scrape exceeded 120s for {event_row.get('event_url')} "
+                f"parking scrape exceeded 45s for {event_row.get('event_url')} "
                 f"(parking_url={event_row.get('parking_url')}, last_probe={probe})"
             ) from exc
         return {
