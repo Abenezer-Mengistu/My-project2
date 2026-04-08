@@ -1266,6 +1266,32 @@ async def _pick_best_spothero_suggestion(payload: dict) -> tuple[dict | None, li
     return best, deduped[:6], best_query
 
 
+def _pick_best_spothero_event(events: list[dict], payload: dict) -> dict | None:
+    if not events:
+        return None
+    title = str(payload.get("title") or payload.get("query") or "").strip()
+    venue_name = str(payload.get("venue_name") or "").strip()
+    location = str(payload.get("location") or "").strip()
+    best: dict | None = None
+    best_score = -1
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get("name") or "").strip()
+        url = str(event.get("url") or "").strip()
+        if not name or not url:
+            continue
+        score = (
+            _score_live_match(title, name)
+            + _score_live_match(venue_name, name)
+            + _score_live_match(location, name)
+        )
+        if score > best_score:
+            best = event
+            best_score = score
+    return best if best_score > 0 else None
+
+
 async def _run_spothero_for_event(event_row: dict) -> dict:
     event_obj = build_spothero_event(
         venue_name=event_row.get("venue") or "SpotHero Venue",
@@ -1308,6 +1334,11 @@ def _spothero_listing_from_pass(row: dict) -> dict:
         "notes": notes,
         "listing_id": row.get("listing_id") or "",
         "available_spaces": row.get("available_spaces"),
+        "reservation_type": row.get("reservation_type") or details.get("reservation_type") or "",
+        "reservation_duration": row.get("reservation_duration") or details.get("reservation_duration") or "",
+        "reservation_starts": row.get("reservation_starts") or details.get("reservation_starts"),
+        "reservation_ends": row.get("reservation_ends") or details.get("reservation_ends"),
+        "in_out_policy": row.get("in_out_policy") or details.get("in_out_policy") or "",
         "source": row.get("_source") or "spothero_api",
     }
 
@@ -1331,7 +1362,7 @@ def _format_spothero_window_label(starts: str | None, ends: str | None) -> str:
     return start_label or end_label
 
 
-async def _fetch_live_spothero_destination_details(destination_id: int, destination_path: str) -> dict:
+async def _fetch_live_spothero_destination_details(destination_id: int, destination_path: str, selection_payload: dict | None = None) -> dict:
     destination_url = destination_path if destination_path.startswith("http") else f"https://spothero.com{destination_path}"
     raw = await _fetch_text(destination_url, ttl_seconds=300)
     next_data = _extract_next_data(raw)
@@ -1416,6 +1447,23 @@ async def _fetch_live_spothero_destination_details(destination_id: int, destinat
         )
         listing_rows = [_spothero_listing_from_pass(item) for item in live_result.get("passes") or []]
 
+    matched_event = _pick_best_spothero_event(events, selection_payload or {})
+    if matched_event:
+        detail_mode = "matched_event"
+        matched_event_url = str(matched_event.get("url") or "").strip()
+        price_source_url = matched_event_url
+        live_result = await _run_spothero_for_event(
+            {
+                "venue": destination_title or "SpotHero Destination",
+                "event_name": str(matched_event.get("name") or destination_title or "SpotHero Event"),
+                "event_url": matched_event_url,
+                "parking_url": matched_event_url,
+            }
+        )
+        event_rows = [_spothero_listing_from_pass(item) for item in live_result.get("passes") or []]
+        if event_rows:
+            listing_rows = event_rows
+
     if not listing_rows and event_urls:
         detail_mode = "event_fallback"
         fallback_event_url = event_urls[0]
@@ -1464,6 +1512,7 @@ async def _fetch_live_spothero_destination_details(destination_id: int, destinat
             "min_price": min(numeric_prices) if numeric_prices else None,
             "max_price": max(numeric_prices) if numeric_prices else None,
         },
+        "matched_event": matched_event,
         "price_window": parking_window_label,
         "price_window_start": window_starts,
         "price_window_end": window_ends,
@@ -1545,6 +1594,7 @@ async def ui_client_search_spothero(request: Request):
         details = await _fetch_live_spothero_destination_details(
             int(best["destination_id"]),
             str(best["path"]),
+            selection_payload=selection_payload,
         )
         details["matched_query"] = best.get("query_used") or matched_query
         details["matched_destination"] = {

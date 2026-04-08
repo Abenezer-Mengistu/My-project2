@@ -154,6 +154,22 @@ def _format_cents(cents: int | None, currency: str = "USD") -> str:
     return f"{currency.upper()} {format(dollars, 'f')}"
 
 
+def _hours_between(starts: str | None, ends: str | None) -> str:
+    start_text = str(starts or "").strip()
+    end_text = str(ends or "").strip()
+    if not start_text or not end_text:
+        return ""
+    try:
+        start_dt = datetime.fromisoformat(start_text.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
+        total_hours = max(0, (end_dt - start_dt).total_seconds() / 3600)
+        if total_hours.is_integer():
+            return f"{int(total_hours)} hours"
+        return f"{round(total_hours, 1)} hours"
+    except Exception:
+        return ""
+
+
 class SpotHeroParkingScraper(TicketingPlaywrightBase):
     handler: str = "spothero-parking"
 
@@ -234,6 +250,8 @@ class SpotHeroParkingScraper(TicketingPlaywrightBase):
                 "initial_search": "true",
                 "oversize": "false",
             }
+        reservation_starts = str(base_params.get("starts") or "").strip() or None
+        reservation_ends = str(base_params.get("ends") or "").strip() or None
 
         for key in ("lat", "lon", "starts", "ends", "fingerprint", "session_id", "search_id", "action_id", "spot_id", "spot-id"):
             value = (source_query.get(key) or [None])[0]
@@ -288,6 +306,8 @@ class SpotHeroParkingScraper(TicketingPlaywrightBase):
             if starts and ends:
                 base_params["starts"] = str(starts)
                 base_params["ends"] = str(ends)
+                reservation_starts = str(starts)
+                reservation_ends = str(ends)
 
         fallback_now = datetime.now(timezone.utc)
         fallback_time_window = {
@@ -348,6 +368,11 @@ class SpotHeroParkingScraper(TicketingPlaywrightBase):
                         "availability": base_availability,
                         "listing_id": listing_id,
                         "available_spaces": available_spaces,
+                        "reservation_type": "Parking Reservation",
+                        "reservation_duration": _hours_between(reservation_starts, reservation_ends),
+                        "reservation_starts": reservation_starts,
+                        "reservation_ends": reservation_ends,
+                        "in_out_policy": "",
                         "rate_index": 0,
                         "rate_external_id": "",
                         "listing_details": {},
@@ -373,6 +398,33 @@ class SpotHeroParkingScraper(TicketingPlaywrightBase):
                     rate_external_id = (quote.get("meta") or {}).get("quote_mac")
                 if rate_external_id is None and isinstance(quote.get("order"), list) and quote["order"]:
                     rate_external_id = (quote["order"][0] or {}).get("rate_id")
+                quote_meta = quote.get("meta") if isinstance(quote.get("meta"), dict) else {}
+                policy_parts: list[str] = []
+                rate_name = str(rate.get("name") or rate.get("title") or "").strip()
+                if rate_name:
+                    policy_parts.append(rate_name)
+                restrictions = rate.get("restrictions")
+                if isinstance(restrictions, list):
+                    for item in restrictions:
+                        if isinstance(item, str) and item.strip():
+                            policy_parts.append(item.strip())
+                        elif isinstance(item, dict):
+                            label = str(item.get("label") or item.get("title") or item.get("name") or "").strip()
+                            if label:
+                                policy_parts.append(label)
+                for key in ("reentry_policy", "in_out_policy", "access_policy"):
+                    value = str(quote_meta.get(key) or "").strip()
+                    if value:
+                        policy_parts.append(value)
+                deduped_policy: list[str] = []
+                seen_policy: set[str] = set()
+                for value in policy_parts:
+                    lowered = value.lower()
+                    if lowered in seen_policy:
+                        continue
+                    seen_policy.add(lowered)
+                    deduped_policy.append(value)
+                in_out_policy = " | ".join(deduped_policy)
                 rows.append(
                     {
                         "lot_name": lot_name,
@@ -384,12 +436,22 @@ class SpotHeroParkingScraper(TicketingPlaywrightBase):
                         "availability": base_availability,
                         "listing_id": listing_id,
                         "available_spaces": available_spaces,
+                        "reservation_type": "Parking Reservation",
+                        "reservation_duration": _hours_between(reservation_starts, reservation_ends),
+                        "reservation_starts": reservation_starts,
+                        "reservation_ends": reservation_ends,
+                        "in_out_policy": in_out_policy,
                         "rate_index": rate_index,
                         "rate_external_id": str(rate_external_id or ""),
                         "listing_details": {
                             "price_incl_fees": total_display,
                             "subtotal_display": subtotal_display,
                             "service_fee_display": fee_display,
+                            "reservation_type": "Parking Reservation",
+                            "reservation_duration": _hours_between(reservation_starts, reservation_ends),
+                            "reservation_starts": reservation_starts,
+                            "reservation_ends": reservation_ends,
+                            "in_out_policy": in_out_policy,
                             "price_breakdown": [
                                 {"label": label, "display": _format_cents(cents, currency)}
                                 for label, cents in breakdown_lines

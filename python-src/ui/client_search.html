@@ -880,8 +880,11 @@
                       <div class="listingPrice">${escapeHtml(listing.price_display || "")}</div>
                     </div>
                     <div class="listingMeta">
+                      ${listing.reservation_type ? `<div>${escapeHtml(listing.reservation_type)}</div>` : ""}
                       ${listing.availability ? `<div>${escapeHtml(listing.availability)}</div>` : ""}
                       ${listing.price_window ? `<div>Price window: ${escapeHtml(listing.price_window)}</div>` : ""}
+                      ${listing.reservation_duration ? `<div>${escapeHtml(listing.reservation_duration)}</div>` : ""}
+                      ${listing.in_out_policy ? `<div>${escapeHtml(listing.in_out_policy)}</div>` : ""}
                       ${listing.notes ? `<div>${escapeHtml(listing.notes)}</div>` : ""}
                     </div>
                     <div class="tagRow">
@@ -913,6 +916,7 @@
                 <div class="summaryMeta">
                   <div>${escapeHtml([details.city, details.state].filter(Boolean).join(", "))}</div>
                   ${details.address ? `<div>${escapeHtml(details.address)}</div>` : ""}
+                  ${details.matched_event && details.matched_event.name ? `<div>Matched event: ${escapeHtml(details.matched_event.name)}</div>` : ""}
                   ${details.matched_query ? `<div>Matched from query: <span class="mono">${escapeHtml(details.matched_query)}</span></div>` : ""}
                   ${details.price_source_url ? `<div><a class="eventLink" href="${escapeHtml(details.price_source_url)}" target="_blank" rel="noreferrer">Open matched SpotHero search</a></div>` : ""}
                 </div>
