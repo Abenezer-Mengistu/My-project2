@@ -906,13 +906,18 @@ async def _fetch_expanded_schedule_items_from_queries(title: str, max_events: in
         for month in month_tokens:
             queries.append(f"{clean_title} {month} {year}")
 
+    semaphore = asyncio.Semaphore(6)
+
+    async def _load_query(query: str) -> list[dict]:
+        async with semaphore:
+            try:
+                return await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
+            except Exception:
+                return []
+
     seen: set[str] = set()
     events: list[dict] = []
-    for query in queries:
-        try:
-            items = await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
-        except Exception:
-            continue
+    for items in await asyncio.gather(*[_load_query(query) for query in queries]):
         for item in items:
             if item.get("isParkingEvent"):
                 continue
@@ -939,13 +944,18 @@ async def _fetch_expanded_parking_candidates_from_queries(title: str, max_events
         for month in month_tokens:
             queries.append(f"parking passes only {clean_title} {month} {year}")
 
+    semaphore = asyncio.Semaphore(6)
+
+    async def _load_query(query: str) -> list[dict]:
+        async with semaphore:
+            try:
+                return await _fetch_stubhub_search_grid_items_paginated(query, max_pages=3)
+            except Exception:
+                return []
+
     seen: set[str] = set()
     parking_events: list[dict] = []
-    for query in queries:
-        try:
-            items = await _fetch_stubhub_search_grid_items_paginated(query, max_pages=2)
-        except Exception:
-            continue
+    for items in await asyncio.gather(*[_load_query(query) for query in queries]):
         for item in items:
             if not item.get("isParkingEvent"):
                 continue
@@ -971,14 +981,14 @@ async def _resolve_client_search_parking_candidates(payload: dict, max_events: i
             _stubhub_item_to_selection(item, source="event")
             for item in await _fetch_stubhub_search_grid_items_paginated(
                 parking_query,
-                max_pages=max(3, min(8, (max_events + 19) // 20 + 2)),
+                max_pages=max(4, min(12, (max_events + 19) // 20 + 2)),
             )
             if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
         ][:max_events]
 
     expanded = await _fetch_expanded_parking_candidates_from_queries(
         payload.get("title") or payload.get("query") or "",
-        max_events=max(120, max_events * 2),
+        max_events=max(240, max_events * 2),
     )
     if expanded:
         return expanded[:max_events]
@@ -986,7 +996,7 @@ async def _resolve_client_search_parking_candidates(payload: dict, max_events: i
     parking_query = _build_parking_query_from_selection(payload)
     return [
         _stubhub_item_to_selection(item, source="event")
-        for item in await _fetch_stubhub_search_grid_items_paginated(parking_query, max_pages=8)
+        for item in await _fetch_stubhub_search_grid_items_paginated(parking_query, max_pages=12)
         if item.get("isParkingEvent") and _canonical_stubhub_url(item.get("url"))
     ][:max_events]
 
@@ -1096,6 +1106,8 @@ def _clean_listing_notes(value: str | None, lot_name: str | None = None) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
+    if text.lower() == "null":
+        return ""
     if lot_name and text.startswith(lot_name):
         text = text[len(lot_name):].strip()
     text = re.sub(r"(?<=\w)(\d+\s+pass(?:es)?)", r" \1", text, flags=re.IGNORECASE)
@@ -1105,6 +1117,46 @@ def _clean_listing_notes(value: str | None, lot_name: str | None = None) -> str:
     text = re.sub(r"(?<!^)(Amazing|Great|Good)", r" | \1", text)
     text = re.sub(r"\s+", " ", text).strip(" |")
     return text
+
+
+def _clean_stubhub_display_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower() == "null":
+        return ""
+    text = re.sub(r"\bnull\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _clean_stubhub_lot_name(row: dict, details: dict) -> str:
+    candidates = [
+        row.get("lot_name"),
+        details.get("title"),
+        details.get("lot_name"),
+    ]
+    for candidate in candidates:
+        text = _clean_stubhub_display_text(candidate)
+        if not text:
+            continue
+        if re.search(r"\bprice per pass\b", text, flags=re.IGNORECASE):
+            continue
+        if re.fullmatch(r"(section|listing)\s+\d+", text, flags=re.IGNORECASE):
+            continue
+        if re.search(r"\$\d", text) and len(text.split()) <= 6:
+            continue
+        return text
+    return ""
+
+
+def _clean_stubhub_availability(row: dict, details: dict) -> str:
+    value = _clean_stubhub_display_text(row.get("availability") or details.get("availability"))
+    if not value:
+        return ""
+    if re.fullmatch(r"\$\d[\d,.]*(?:\.\d{1,2})?\+?", value):
+        return ""
+    return value
 
 
 def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> list[dict]:
@@ -1141,6 +1193,11 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
             continue
         meta = meta_by_url.get(canonical, {})
         details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        lot_name = _clean_stubhub_lot_name(row, details)
+        availability = _clean_stubhub_availability(row, details)
+        notes = _clean_listing_notes(details.get("notes"), lot_name)
+        if not lot_name and not availability and not notes:
+            continue
         group = grouped.setdefault(
             canonical,
             {
@@ -1158,12 +1215,12 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
         )
         group["listings"].append(
             {
-                "lot_name": row.get("lot_name") or details.get("title") or "",
-                "availability": row.get("availability") or details.get("availability") or "",
+                "lot_name": lot_name,
+                "availability": availability,
                 "price_display": _price_display_for_row(row),
                 "price_value": row.get("price"),
-                "rating": details.get("rating") or "",
-                "notes": _clean_listing_notes(details.get("notes"), row.get("lot_name") or details.get("title")),
+                "rating": _clean_stubhub_display_text(details.get("rating")),
+                "notes": notes,
                 "listing_id": row.get("listing_id"),
                 "raw_details": row.get("listing_details"),
             }
@@ -1628,10 +1685,10 @@ async def ui_client_search_run(request: Request):
 
     max_events_raw = payload.get("max_events")
     try:
-        max_events = int(max_events_raw) if max_events_raw is not None else 48
+        max_events = int(max_events_raw) if max_events_raw is not None else 120
     except Exception:
-        max_events = 48
-    max_events = max(1, min(60, max_events))
+        max_events = 120
+    max_events = max(1, min(180, max_events))
 
     try:
         selection_payload = _client_search_payload_from_request_payload(payload)
@@ -1692,6 +1749,11 @@ async def ui_client_search_event_details(request: Request):
     }
 
     try:
+        cache_key = f"stubhub:event-details:{parking_url}"
+        cached = _live_cache_get(cache_key, 300)
+        if isinstance(cached, dict):
+            return cached
+
         phase2_result = await ticketing_phase2(
             parking_urls=parking_url,
             limit=1,
@@ -1705,12 +1767,13 @@ async def ui_client_search_event_details(request: Request):
 
         grouped_results = _group_client_search_results([search_item], phase2_result.get("data") or [])
         card = grouped_results[0] if grouped_results else _group_client_search_results([search_item], [])[0]
-        return {
+        payload = {
             "success": True,
             "parking_url": parking_url,
             "card": card,
             "errors": phase2_result.get("errors") or [],
         }
+        return _live_cache_set(cache_key, payload)
     except Exception as exc:
         logger.error(f"Client search event-details failed for {parking_url}: {exc}")
         return JSONResponse({"success": False, "error": str(exc), "parking_url": parking_url}, status_code=502)

@@ -123,13 +123,13 @@
         border-radius: 22px;
         padding: 18px;
       }
-      .searchRow, .filterRow {
+      .searchRow, .filterRow, .sharedFilterRow {
         display: grid;
         grid-template-columns: 1fr auto;
         gap: 12px;
         align-items: center;
       }
-      .filterRow {
+      .filterRow, .sharedFilterRow {
         margin-top: 12px;
       }
       .spotHeroRow {
@@ -140,9 +140,17 @@
         align-items: center;
       }
       @media (max-width: 820px) {
-        .searchRow, .filterRow, .spotHeroRow {
+        .searchRow, .filterRow, .spotHeroRow, .sharedFilterRow {
           grid-template-columns: 1fr;
         }
+      }
+      .sharedFilters {
+        margin-top: 18px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        border-radius: 22px;
+        padding: 18px;
       }
       .searchInput {
         width: 100%;
@@ -464,7 +472,20 @@
             <span class="pill">Sources: <span class="mono">Two parking marketplaces</span></span>
           </div>
         </div>
-        <div class="filterRow">
+        <div class="actionsRow">
+          <button id="downloadStubhubBtn" class="button" type="button" disabled>Download StubHub Excel</button>
+          <button id="downloadSpotheroBtn" class="button" type="button" disabled>Download SpotHero Excel</button>
+          <button id="downloadBothBtn" class="button" type="button" disabled>Download Both Excel</button>
+        </div>
+        <div id="suggestions" class="suggestions"></div>
+        <div class="statusRow">
+          <div id="status" class="status"></div>
+          <div id="timer" class="timer"></div>
+        </div>
+      </div>
+
+      <div class="sharedFilters">
+        <div class="sharedFilterRow">
           <input
             id="listFilterInput"
             class="searchInput"
@@ -476,15 +497,16 @@
             <span class="pill">Prices: <span class="mono">USD</span></span>
           </div>
         </div>
-        <div class="actionsRow">
-          <button id="downloadStubhubBtn" class="button" type="button" disabled>Download StubHub Excel</button>
-          <button id="downloadSpotheroBtn" class="button" type="button" disabled>Download SpotHero Excel</button>
-          <button id="downloadBothBtn" class="button" type="button" disabled>Download Both Excel</button>
-        </div>
-        <div id="suggestions" class="suggestions"></div>
-        <div class="statusRow">
-          <div id="status" class="status"></div>
-          <div id="timer" class="timer"></div>
+        <div class="filterRow">
+          <input
+            id="dateFilterInput"
+            class="searchInput"
+            type="date"
+            autocomplete="off"
+          />
+          <div class="filterMeta">
+            <span class="pill">Shared date filter</span>
+          </div>
         </div>
       </div>
 
@@ -538,6 +560,7 @@
 
       const searchInput = el("searchInput");
       const listFilterInput = el("listFilterInput");
+      const dateFilterInput = el("dateFilterInput");
       const spotheroSearchInput = el("spotheroSearchInput");
       const spotheroSearchBtn = el("spotheroSearchBtn");
       const suggestionsEl = el("suggestions");
@@ -564,6 +587,8 @@
       let spotheroSearchRunId = 0;
       let currentSpotHeroDetails = null;
       let currentSpotHeroSuggestions = [];
+      let stubhubListingPages = {};
+      const STUBHUB_PAGE_SIZE = 10;
 
       function applyTheme(theme) {
         const root = document.documentElement;
@@ -642,6 +667,17 @@
         timerEl.innerHTML = "";
       }
 
+      function finishRunTimer() {
+        if (!runStartedAt) {
+          return;
+        }
+        timerEl.innerHTML = `<strong>Total time:</strong> ${formatElapsed(Date.now() - runStartedAt)}`;
+        if (runTimer) {
+          clearInterval(runTimer);
+          runTimer = null;
+        }
+      }
+
       function startRunTimer() {
         stopRunTimer();
         runStartedAt = Date.now();
@@ -654,13 +690,6 @@
       function setLoading(value) {
         running = value;
         searchInput.classList.toggle("loading", value);
-        if (!value && runStartedAt) {
-          timerEl.innerHTML = `<strong>Total time:</strong> ${formatElapsed(Date.now() - runStartedAt)}`;
-          if (runTimer) {
-            clearInterval(runTimer);
-            runTimer = null;
-          }
-        }
       }
 
       function monthDayParts(value) {
@@ -670,6 +699,58 @@
 
       function currentListFilter() {
         return String(listFilterInput.value || "").trim().toLowerCase();
+      }
+
+      function currentDateFilter() {
+        return String(dateFilterInput.value || "").trim();
+      }
+
+      function stubhubCardDateKey(card) {
+        const url = String((card && card.parking_url) || "");
+        const match = url.match(/tickets-(\d{1,2})-(\d{1,2})-(\d{4})\/event\//i);
+        if (match) {
+          const month = String(match[1]).padStart(2, "0");
+          const day = String(match[2]).padStart(2, "0");
+          return `${match[3]}-${month}-${day}`;
+        }
+        const text = String((card && card.formatted_date) || "").trim();
+        const parsed = text ? new Date(text) : null;
+        if (parsed && !Number.isNaN(parsed.getTime())) {
+          const month = String(parsed.getMonth() + 1).padStart(2, "0");
+          const day = String(parsed.getDate()).padStart(2, "0");
+          return `${parsed.getFullYear()}-${month}-${day}`;
+        }
+        return "";
+      }
+
+      function spotHeroListingDateKey(listing) {
+        const value = String((listing && (listing.reservation_starts || listing.price_window_start)) || "").trim();
+        if (!value) {
+          return "";
+        }
+        const parsed = new Date(value);
+        if (Number.isNaN(parsed.getTime())) {
+          return "";
+        }
+        const month = String(parsed.getMonth() + 1).padStart(2, "0");
+        const day = String(parsed.getDate()).padStart(2, "0");
+        return `${parsed.getFullYear()}-${month}-${day}`;
+      }
+
+      function cardMatchesDateFilter(card) {
+        const filter = currentDateFilter();
+        if (!filter) {
+          return true;
+        }
+        return stubhubCardDateKey(card) === filter;
+      }
+
+      function listingMatchesDateFilter(listing) {
+        const filter = currentDateFilter();
+        if (!filter) {
+          return true;
+        }
+        return spotHeroListingDateKey(listing) === filter;
       }
 
       function normalizeVenueForSpotHero(value) {
@@ -742,6 +823,19 @@
           .join(" ")
           .toLowerCase();
         return fields.includes(filter);
+      }
+
+      function getStubHubListingPage(parkingUrl) {
+        const page = Number(stubhubListingPages[String(parkingUrl || "")] || 1);
+        return Number.isFinite(page) && page > 0 ? page : 1;
+      }
+
+      function setStubHubListingPage(parkingUrl, page) {
+        const key = String(parkingUrl || "");
+        if (!key) {
+          return;
+        }
+        stubhubListingPages[key] = Math.max(1, Number(page) || 1);
       }
 
       function showSuggestions() {
@@ -825,17 +919,25 @@
         currentCards = Array.isArray(cards) ? cards : [];
         setDownloadEnabled();
 
-        if (!currentCards.length) {
+        const filteredCards = currentCards.filter(cardMatchesDateFilter);
+
+        if (!filteredCards.length) {
           stubhubResultsEl.innerHTML = `<div class="empty">No parking events were found for this StubHub selection.</div>`;
           return;
         }
 
-        stubhubResultsEl.innerHTML = currentCards
+        stubhubResultsEl.innerHTML = filteredCards
           .map((card) => {
             const date = monthDayParts(card.formatted_date);
             const visibleListings = (card.listings || []).filter(lotMatchesFilter);
-            const listingsMarkup = visibleListings.length
-              ? visibleListings
+            const totalCount = Number(card.listing_count || 0);
+            const shownCount = visibleListings.length;
+            const totalPages = Math.max(1, Math.ceil(shownCount / STUBHUB_PAGE_SIZE));
+            const currentPage = Math.min(getStubHubListingPage(card.parking_url), totalPages);
+            setStubHubListingPage(card.parking_url, currentPage);
+            const pagedListings = visibleListings.slice((currentPage - 1) * STUBHUB_PAGE_SIZE, currentPage * STUBHUB_PAGE_SIZE);
+            const listingsMarkup = pagedListings.length
+              ? pagedListings
                   .map((listing) => {
                     const tags = [listing.availability, listing.rating].filter(Boolean);
                     return `
@@ -855,9 +957,17 @@
                   .join("")
               : `<div class="empty">No StubHub listings match the current filter for this event.</div>`;
 
-            const totalCount = Number(card.listing_count || 0);
-            const shownCount = visibleListings.length;
             const countLabel = currentListFilter() ? `${shownCount}/${totalCount} listings` : `${totalCount} listings`;
+            const pagerMarkup =
+              shownCount > STUBHUB_PAGE_SIZE
+                ? `
+                    <div class="eventActions" style="margin-top:12px">
+                      <button class="miniButton" type="button" data-page-url="${escapeHtml(card.parking_url)}" data-page-action="prev" ${currentPage <= 1 ? "disabled" : ""}>Previous</button>
+                      <span class="tag">Page ${currentPage} of ${totalPages}</span>
+                      <button class="miniButton" type="button" data-page-url="${escapeHtml(card.parking_url)}" data-page-action="next" ${currentPage >= totalPages ? "disabled" : ""}>Next</button>
+                    </div>
+                  `
+                : "";
 
             return `
               <section class="eventCard">
@@ -885,6 +995,7 @@
                     <div class="countPill">${escapeHtml(countLabel)}</div>
                   </div>
                   <div class="listingGrid">${listingsMarkup}</div>
+                  ${pagerMarkup}
                 </div>
               </section>
             `;
@@ -902,6 +1013,15 @@
         });
         stubhubResultsEl.querySelectorAll("[data-copy-venue]").forEach((button) => {
           button.addEventListener("click", () => copyText(normalizeVenueForSpotHero(button.getAttribute("data-copy-venue"))));
+        });
+        stubhubResultsEl.querySelectorAll("[data-page-url][data-page-action]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const parkingUrl = button.getAttribute("data-page-url");
+            const action = button.getAttribute("data-page-action");
+            const currentPage = getStubHubListingPage(parkingUrl);
+            setStubHubListingPage(parkingUrl, action === "prev" ? currentPage - 1 : currentPage + 1);
+            renderStubHubResults(currentCards);
+          });
         });
         stubhubResultsEl.querySelectorAll("[data-use-venue]").forEach((button) => {
           button.addEventListener("click", async () => {
@@ -937,10 +1057,18 @@
           if (runId !== progressiveRunId) {
             return;
           }
+          const nextCard = { ...(data.card || card) };
+          const loadedCount = Number(
+            nextCard.listing_count != null
+              ? nextCard.listing_count
+              : Array.isArray(nextCard.listings)
+                ? nextCard.listings.length
+                : 0
+          );
           updateCard({
-            ...(data.card || card),
+            ...nextCard,
             scrape_state: "done",
-            scrape_label: `Loaded ${Number((data.card && data.card.listing_count) || 0)} listings`,
+            scrape_label: loadedCount > 0 ? `Loaded ${loadedCount} listings` : "No listings loaded",
           });
         } catch (error) {
           if (runId !== progressiveRunId) {
@@ -952,7 +1080,7 @@
 
       async function progressiveLoadListings(runId) {
         const cards = [...currentCards];
-        const concurrency = 2;
+        const concurrency = Math.max(4, Math.min(8, cards.length, Number(navigator.hardwareConcurrency || 6)));
         let index = 0;
 
         async function worker() {
@@ -1000,7 +1128,7 @@
         }
 
         const details = currentSpotHeroDetails;
-        const visibleListings = (details.listings || []).filter(lotMatchesFilter);
+        const visibleListings = (details.listings || []).filter((listing) => lotMatchesFilter(listing) && listingMatchesDateFilter(listing));
         const summary = details.listing_summary || {};
         const listingMarkup = visibleListings.length
           ? visibleListings
@@ -1267,6 +1395,7 @@
       async function runSelection(selection) {
         currentSelection = selection;
         currentCards = [];
+        stubhubListingPages = {};
         currentParkingQuery = "";
         setDownloadEnabled(false);
         progressiveRunId += 1;
@@ -1286,7 +1415,7 @@
           const resp = await fetch("/ticketing/ui/client-search/run", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify(selection),
+            body: JSON.stringify({ ...selection, max_events: 120 }),
           });
           const data = await resp.json();
           if (!data || data.success !== true) {
@@ -1318,10 +1447,13 @@
             }
             const loaded = currentCards.filter((card) => card.scrape_state === "done").length;
             const failed = currentCards.filter((card) => card.scrape_state === "error").length;
+            finishRunTimer();
             setStatus(
               `<span class="ok">StubHub progressive load finished.</span> Query <span class="mono">${escapeHtml(currentParkingQuery || "")}</span> discovered <strong>${currentCards.length}</strong> parking events, loaded <strong>${loaded}</strong>, failed <strong>${failed}</strong>.`
             );
           });
+        } else {
+          finishRunTimer();
         }
 
         setDownloadEnabled();
@@ -1341,6 +1473,11 @@
       });
 
       listFilterInput.addEventListener("input", () => {
+        renderStubHubResults(currentCards);
+        renderSpotHeroResults();
+      });
+
+      dateFilterInput.addEventListener("input", () => {
         renderStubHubResults(currentCards);
         renderSpotHeroResults();
       });

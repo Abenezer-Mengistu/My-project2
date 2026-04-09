@@ -313,11 +313,22 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 continue
         return max_count
 
+    @staticmethod
+    def _extract_total_listing_count(body_text: str) -> int | None:
+        match = re.search(r"\b([0-9][0-9,]*)\s+listings\b", body_text or "", flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1).replace(",", ""))
+        except Exception:
+            return None
+
     async def _load_all_listing_inventory(self) -> None:
-        max_duration_seconds = 35.0
+        max_duration_seconds = 45.0
         started_at = time.perf_counter()
         stable_rounds = 0
         last_visible_count = -1
+        target_listing_count: int | None = None
 
         for _ in range(24):
             if time.perf_counter() - started_at >= max_duration_seconds:
@@ -359,12 +370,21 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             except Exception:
                 await asyncio.sleep(1.2)
 
+            try:
+                body_text = await self.page.evaluate("""() => document.body.innerText || ''""")
+                target_listing_count = max(target_listing_count or 0, self._extract_total_listing_count(body_text) or 0) or target_listing_count
+            except Exception:
+                pass
+
             visible_count = await self._count_visible_listing_nodes()
             if visible_count <= last_visible_count:
                 stable_rounds += 1
             else:
                 stable_rounds = 0
             last_visible_count = max(last_visible_count, visible_count)
+
+            if target_listing_count and last_visible_count < target_listing_count:
+                continue
 
             if stable_rounds >= 4:
                 break
@@ -567,20 +587,17 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             logger.warning(f"[Scraper] Failed to save debug screenshot: {e}")
 
         await self.human_delay()
-        passes = await _extract_from_context(self.page)
-        logger.info(f"[Scraper] DOM extraction found {len(passes or [])} passes")
-        if passes:
-            return passes
+        dom_passes = await _extract_from_context(self.page)
+        logger.info(f"[Scraper] DOM extraction found {len(dom_passes or [])} passes")
 
+        frame_passes: list[dict] = []
         for frame in self.page.frames:
             if frame == self.page.main_frame:
                 continue
             try:
-                passes = await _extract_from_context(frame)
+                frame_passes.extend(await _extract_from_context(frame))
             except Exception:
-                passes = []
-            if passes:
-                return passes
+                continue
 
         # Fallback: scan for listing panels that include a price + "incl. fees".
         try:
@@ -627,7 +644,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             panel_cards = []
 
         if panel_cards:
-            passes = []
+            panel_passes = []
             seen = set()
             for data in panel_cards:
                 text = data.get("text") or ""
@@ -648,7 +665,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 if dedup_key in seen:
                     continue
                 seen.add(dedup_key)
-                passes.append(
+                panel_passes.append(
                     {
                         "lot_name": lot_name,
                         "normalized_lot_name": normalize_lot_name(lot_name),
@@ -659,8 +676,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "details": text if len(text) < 500 else text[:500] + "...",
                     }
                 )
-            if passes:
-                return passes
+        else:
+            panel_passes = []
 
         # Fallback: fuzzy DOM scan for listing-like cards.
         try:
@@ -688,7 +705,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         except Exception:
             return []
 
-        passes = []
+        fuzzy_passes = []
         seen = set()
         for data in raw_cards or []:
             text = data.get("text") or ""
@@ -706,7 +723,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
-            passes.append(
+            fuzzy_passes.append(
                 {
                     "lot_name": lot_name,
                     "normalized_lot_name": normalize_lot_name(lot_name),
@@ -717,7 +734,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "details": text if len(text) < 500 else text[:500] + "...",
                 }
             )
-        return passes
+        return self._merge_pass_collections(dom_passes, frame_passes, panel_passes, fuzzy_passes)
 
     async def _extract_passes_from_state(self) -> list[dict]:
         payload = await self.page.evaluate(
@@ -1033,6 +1050,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     return
 
             try:
+                advertised_total = None
+
                 def _handle_response(resp):
                     task = asyncio.create_task(_capture_response(resp))
                     response_tasks.add(task)
@@ -1055,13 +1074,19 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 try:
                     body_text = await self.page.evaluate("""() => document.body.innerText || ''""")
                     visible_before_expand = await self._count_visible_listing_nodes()
-                    has_listing_count = bool(re.search(r"\b\d+\s+listings\b", body_text, flags=re.IGNORECASE))
-                    if has_listing_count and visible_before_expand >= 20:
-                        logger.info(
-                            f"[Scraper] Detected virtualized listing pane ({visible_before_expand} visible cards); skipping pre-scroll expansion."
-                        )
-                    else:
+                    total_listing_count = self._extract_total_listing_count(body_text)
+                    advertised_total = total_listing_count or advertised_total
+                    should_expand = (
+                        total_listing_count is None
+                        or visible_before_expand < total_listing_count
+                        or visible_before_expand < 40
+                    )
+                    if should_expand:
                         await self._load_all_listing_inventory()
+                    else:
+                        logger.info(
+                            f"[Scraper] Listing pane already appears expanded ({visible_before_expand}/{total_listing_count or visible_before_expand} visible)."
+                        )
                 except Exception as exc:
                     logger.warning(f"[Scraper] Inventory expansion failed; continuing with partial page state: {exc}")
 
@@ -1082,6 +1107,33 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
                 passes = self._filter_telemetry_rows(passes)
 
+                if advertised_total and len(passes) + 5 < advertised_total:
+                    logger.info(
+                        f"[Scraper] Extracted {len(passes)} listings but page advertises {advertised_total}; retrying expansion."
+                    )
+                    try:
+                        await asyncio.sleep(1.5)
+                        await self._load_all_listing_inventory()
+                        dom_retry = await self._extract_passes_from_dom()
+                        state_retry = await self._extract_passes_from_state()
+                        embedded_retry = await self._extract_passes_from_embedded_json()
+                        xhr_retry: list[dict] = []
+                        for payload in captured_payloads + captured_request_payloads:
+                            extracted = self._extract_passes_from_json_payload(payload)
+                            if not extracted:
+                                extracted = self._extract_passes_from_text(payload, source=f"embedded_xhr_retry_{label}")
+                            xhr_retry.extend(extracted)
+                        passes = self._merge_pass_collections(
+                            passes,
+                            dom_retry,
+                            state_retry,
+                            embedded_retry,
+                            xhr_retry,
+                        )
+                        passes = self._filter_telemetry_rows(passes)
+                    except Exception as retry_exc:
+                        logger.warning(f"[Scraper] Retry expansion/extraction failed: {retry_exc}")
+
                 probe = {
                     "attempt": label,
                     "url": self.page.url,
@@ -1095,6 +1147,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "embedded_passes": len(embedded_passes),
                     "xhr_passes": len(xhr_passes),
                     "merged_passes": len(passes),
+                    "advertised_total": advertised_total,
                 }
                 return passes, probe
             finally:
