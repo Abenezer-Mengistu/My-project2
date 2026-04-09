@@ -825,6 +825,37 @@
         return fields.includes(filter);
       }
 
+      function dedupeStubHubListings(listings) {
+        const deduped = [];
+        const seen = new Set();
+        for (const listing of Array.isArray(listings) ? listings : []) {
+          const key = [
+            String((listing && listing.lot_name) || "").trim().toLowerCase(),
+            String((listing && listing.price_display) || "").trim(),
+            String((listing && listing.availability) || "").trim().toLowerCase(),
+            String((listing && listing.notes) || "").trim().toLowerCase(),
+            String((listing && listing.rating) || "").trim().toLowerCase(),
+          ].join("|");
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          deduped.push(listing);
+        }
+        return deduped;
+      }
+
+      function getDisplayStubHubListings(card) {
+        return dedupeStubHubListings(
+          ((card && card.listings) || []).filter(
+            (listing) =>
+              listing &&
+              listing.lot_name &&
+              !/^(parking(?: listing)?|section\s+\d+|listing\s+\d+|\d+% off)$/i.test(String(listing.lot_name).trim())
+          )
+        );
+      }
+
       function getStubHubListingPage(parkingUrl) {
         const page = Number(stubhubListingPages[String(parkingUrl || "")] || 1);
         return Number.isFinite(page) && page > 0 ? page : 1;
@@ -929,8 +960,9 @@
         stubhubResultsEl.innerHTML = filteredCards
           .map((card) => {
             const date = monthDayParts(card.formatted_date);
-            const visibleListings = (card.listings || []).filter(lotMatchesFilter);
-            const totalCount = Number(card.listing_count || 0);
+            const displayListings = getDisplayStubHubListings(card);
+            const visibleListings = displayListings.filter(lotMatchesFilter);
+            const totalCount = displayListings.length;
             const shownCount = visibleListings.length;
             const totalPages = Math.max(1, Math.ceil(shownCount / STUBHUB_PAGE_SIZE));
             const currentPage = Math.min(getStubHubListingPage(card.parking_url), totalPages);
@@ -939,7 +971,7 @@
             const listingsMarkup = pagedListings.length
               ? pagedListings
                   .map((listing) => {
-                    const tags = [listing.availability, listing.rating].filter(Boolean);
+                    const tags = [listing.rating].filter(Boolean);
                     return `
                       <div class="listingCard">
                         <div class="listingTop">
@@ -1058,13 +1090,7 @@
             return;
           }
           const nextCard = { ...(data.card || card) };
-          const loadedCount = Number(
-            nextCard.listing_count != null
-              ? nextCard.listing_count
-              : Array.isArray(nextCard.listings)
-                ? nextCard.listings.length
-                : 0
-          );
+          const loadedCount = getDisplayStubHubListings(nextCard).length;
           updateCard({
             ...nextCard,
             scrape_state: "done",
@@ -1074,7 +1100,12 @@
           if (runId !== progressiveRunId) {
             return;
           }
-          updateCard({ ...card, scrape_state: "error", scrape_label: "Listing load failed" });
+          const message = String(error || "").trim();
+          updateCard({
+            ...card,
+            scrape_state: "error",
+            scrape_label: message && message !== "Error" ? `Listing load failed: ${message}` : "Listing load failed",
+          });
         }
       }
 

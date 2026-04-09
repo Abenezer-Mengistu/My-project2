@@ -470,9 +470,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                                 || node.getAttribute('data-listingid')
                                 || node.dataset?.listingId
                                 || null;
-                            const title = node.querySelector('h3')?.textContent?.trim()
-                                       || node.querySelector('strong')?.textContent?.trim()
-                                       || null;
+                            const title = node.querySelector('h3')?.textContent?.trim() || null;
                             let priceText = null;
                             const priceNodes = Array.from(node.querySelectorAll('div, span, b, p'));
                             for (const p of priceNodes) {

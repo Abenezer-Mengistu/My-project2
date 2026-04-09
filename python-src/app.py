@@ -1106,7 +1106,7 @@ def _clean_listing_notes(value: str | None, lot_name: str | None = None) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if text.lower() == "null":
+    if text.startswith("[{") or text.startswith("{'") or text.startswith('{"'):
         return ""
     if lot_name and text.startswith(lot_name):
         text = text[len(lot_name):].strip()
@@ -1119,44 +1119,68 @@ def _clean_listing_notes(value: str | None, lot_name: str | None = None) -> str:
     return text
 
 
-def _clean_stubhub_display_text(value: str | None) -> str:
+def _clean_stubhub_text(value: str | None) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
     if text.lower() == "null":
         return ""
-    text = re.sub(r"\bnull\b", " ", text, flags=re.IGNORECASE)
+    if text.startswith("[{") or text.startswith("{'") or text.startswith('{"'):
+        return ""
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def _clean_stubhub_lot_name(row: dict, details: dict) -> str:
+def _is_generic_stubhub_lot_name(value: str | None) -> bool:
+    text = _clean_stubhub_text(value)
+    return bool(re.fullmatch(r"(Section|Listing)\s+\d+", text, flags=re.IGNORECASE))
+
+
+def _is_unusable_stubhub_lot_name(value: str | None) -> bool:
+    text = _clean_stubhub_text(value)
+    if not text:
+        return True
+    if _is_generic_stubhub_lot_name(text):
+        return True
+    if re.fullmatch(r"Parking(?: listing)?", text, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(r"[0-9]+% off", text, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(r"(Within\s+[0-9.]+\s+Mile(?:s)?\s+Of\s+Venue|Within\s+[0-9.]+\s+mi)", text, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _choose_stubhub_lot_name(row: dict, details: dict) -> str:
     candidates = [
         row.get("lot_name"),
         details.get("title"),
         details.get("lot_name"),
+        details.get("name"),
     ]
     for candidate in candidates:
-        text = _clean_stubhub_display_text(candidate)
+        text = _clean_stubhub_text(candidate)
         if not text:
             continue
         if re.search(r"\bprice per pass\b", text, flags=re.IGNORECASE):
             continue
-        if re.fullmatch(r"(section|listing)\s+\d+", text, flags=re.IGNORECASE):
+        text = re.sub(r"\s*-\s*[0-9.]+\s+mi(?:les?)?\s+(?:from venue|away)\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*-\s*within\s+[0-9.]+\s+mi(?:les?)?\b", "", text, flags=re.IGNORECASE)
+        text = text.strip(" -")
+        if not text:
             continue
-        if re.search(r"\$\d", text) and len(text.split()) <= 6:
+        if re.fullmatch(r"\$?\d[\d,.]*(?:\.\d{1,2})?\+?", text):
+            continue
+        if re.fullmatch(r"\d+\s*-\s*\d+\s+passes?", text, flags=re.IGNORECASE):
+            continue
+        if re.fullmatch(r"\d+\s+passes?", text, flags=re.IGNORECASE):
+            continue
+        if re.fullmatch(r"(Within\s+[0-9.]+\s+Mile(?:s)?\s+Of\s+Venue|Within\s+[0-9.]+\s+mi)", text, flags=re.IGNORECASE):
+            continue
+        if _is_generic_stubhub_lot_name(text):
             continue
         return text
     return ""
-
-
-def _clean_stubhub_availability(row: dict, details: dict) -> str:
-    value = _clean_stubhub_display_text(row.get("availability") or details.get("availability"))
-    if not value:
-        return ""
-    if re.fullmatch(r"\$\d[\d,.]*(?:\.\d{1,2})?\+?", value):
-        return ""
-    return value
 
 
 def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> list[dict]:
@@ -1193,10 +1217,9 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
             continue
         meta = meta_by_url.get(canonical, {})
         details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
-        lot_name = _clean_stubhub_lot_name(row, details)
-        availability = _clean_stubhub_availability(row, details)
-        notes = _clean_listing_notes(details.get("notes"), lot_name)
-        if not lot_name and not availability and not notes:
+        lot_name = _choose_stubhub_lot_name(row, details)
+        availability = _clean_stubhub_text(row.get("availability") or details.get("availability"))
+        if _is_unusable_stubhub_lot_name(lot_name):
             continue
         group = grouped.setdefault(
             canonical,
@@ -1219,8 +1242,8 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
                 "availability": availability,
                 "price_display": _price_display_for_row(row),
                 "price_value": row.get("price"),
-                "rating": _clean_stubhub_display_text(details.get("rating")),
-                "notes": notes,
+                "rating": _clean_stubhub_text(details.get("rating")),
+                "notes": _clean_listing_notes(details.get("notes"), lot_name),
                 "listing_id": row.get("listing_id"),
                 "raw_details": row.get("listing_details"),
             }
@@ -1754,13 +1777,21 @@ async def ui_client_search_event_details(request: Request):
         if isinstance(cached, dict):
             return cached
 
-        phase2_result = await ticketing_phase2(
-            parking_urls=parking_url,
-            limit=1,
-            batch_size=1,
-            export_json=False,
-            persist=False,
-            alert_on_failures=False,
+        failed_cache_key = f"stubhub:event-details:failed:{parking_url}"
+        failed_cached = _live_cache_get(failed_cache_key, 120)
+        if isinstance(failed_cached, dict):
+            return JSONResponse(failed_cached, status_code=502)
+
+        phase2_result = await asyncio.wait_for(
+            ticketing_phase2(
+                parking_urls=parking_url,
+                limit=1,
+                batch_size=1,
+                export_json=False,
+                persist=False,
+                alert_on_failures=False,
+            ),
+            timeout=150.0,
         )
         if isinstance(phase2_result, JSONResponse):
             return phase2_result
@@ -1774,9 +1805,20 @@ async def ui_client_search_event_details(request: Request):
             "errors": phase2_result.get("errors") or [],
         }
         return _live_cache_set(cache_key, payload)
+    except asyncio.TimeoutError:
+        error_payload = {
+            "success": False,
+            "error": "Listing scrape timed out for this event",
+            "parking_url": parking_url,
+        }
+        _live_cache_set(f"stubhub:event-details:failed:{parking_url}", error_payload)
+        logger.error(f"Client search event-details timed out for {parking_url}")
+        return JSONResponse(error_payload, status_code=502)
     except Exception as exc:
         logger.error(f"Client search event-details failed for {parking_url}: {exc}")
-        return JSONResponse({"success": False, "error": str(exc), "parking_url": parking_url}, status_code=502)
+        error_payload = {"success": False, "error": str(exc), "parking_url": parking_url}
+        _live_cache_set(f"stubhub:event-details:failed:{parking_url}", error_payload)
+        return JSONResponse(error_payload, status_code=502)
 
 
 @app.post("/ui/parking-links/run")
@@ -3399,7 +3441,7 @@ async def _run_parking_for_event(event_row: dict) -> list[dict]:
         try:
             passes = await asyncio.wait_for(
                 instance.scrape_parking_details(event_obj),
-                timeout=120,
+                timeout=240,
             )
         except asyncio.TimeoutError as exc:
             probe = getattr(instance, "_last_probe", {}) or {}
