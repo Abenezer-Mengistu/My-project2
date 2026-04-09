@@ -535,6 +535,13 @@
         color: var(--text);
         font-size: 14px;
       }
+      .emptyStateError {
+        color: #dc2626;
+        font-weight: 500;
+      }
+      :root[data-theme="dark"] .emptyStateError {
+        color: #f87171;
+      }
       .loadingPanel {
         border-radius: 12px;
         padding: 16px;
@@ -821,6 +828,53 @@
         color: var(--accent-2);
       }
       .loading { opacity: 0.7; }
+      .inlineState {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 40px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .inlineSpinner {
+        width: 14px;
+        height: 14px;
+        border-radius: 999px;
+        border: 2px solid rgba(120, 167, 255, 0.2);
+        border-top-color: var(--accent);
+        animation: spinLoader 0.9s linear infinite;
+        flex: 0 0 auto;
+      }
+      .inlineQueue {
+        width: 14px;
+        height: 14px;
+        border-radius: 999px;
+        border: 2px solid rgba(148, 163, 184, 0.35);
+        position: relative;
+        flex: 0 0 auto;
+      }
+      .inlineQueue::before {
+        content: "";
+        position: absolute;
+        left: 5px;
+        top: 2px;
+        width: 2px;
+        height: 5px;
+        background: rgba(148, 163, 184, 0.85);
+        border-radius: 999px;
+      }
+      .inlineQueue::after {
+        content: "";
+        position: absolute;
+        left: 5px;
+        top: 6px;
+        width: 4px;
+        height: 2px;
+        background: rgba(148, 163, 184, 0.85);
+        border-radius: 999px;
+        transform-origin: left center;
+        transform: rotate(35deg);
+      }
       @keyframes spinLoader {
         from { transform: rotate(0deg); }
         to { transform: rotate(360deg); }
@@ -1302,6 +1356,13 @@
         return fields.includes(filter);
       }
 
+      function getListingUIState({ isLoading, isQueued, listings }) {
+        if (isLoading) return "loading";
+        if (isQueued) return "queued";
+        if (!isLoading && !isQueued && (!Array.isArray(listings) || listings.length === 0)) return "no_data";
+        return "has_data";
+      }
+
       function showSuggestions() {
         suggestionsEl.classList.toggle("open", suggestions.length > 0);
       }
@@ -1421,22 +1482,35 @@
           .map((card) => {
             const visibleListings = (card.listings || []).filter(lotMatchesFilter);
             const previewListings = visibleListings.slice(0, 3);
-            const listingsMarkup = visibleListings.length
-              ? previewListings
-                  .map((listing) => {
-                    const metaParts = [listing.availability, listing.notes].filter(Boolean);
-                    return `
-                      <div class="listingRowCompact">
-                        <div>
-                          <div class="listingRowName">${escapeHtml(listing.lot_name)}</div>
-                          ${metaParts.length ? `<div class="listingRowMeta">${escapeHtml(metaParts.join(" • "))}</div>` : ""}
-                        </div>
-                        <div class="listingRowPrice">${escapeHtml(listing.price_display || "")}</div>
+            const scrapeState = String(card.scrape_state || "").trim().toLowerCase();
+            const listingUiState = getListingUIState({
+              isLoading: scrapeState === "loading",
+              isQueued: !scrapeState || scrapeState === "queued",
+              listings: visibleListings,
+            });
+            let listingsMarkup = "";
+            if (listingUiState === "loading") {
+              listingsMarkup = `<div class="inlineState"><span class="inlineSpinner" aria-hidden="true"></span><span>Loading listings...</span></div>`;
+            } else if (listingUiState === "queued") {
+              listingsMarkup = `<div class="inlineState"><span class="inlineQueue" aria-hidden="true"></span><span>Queued for listing scrape</span></div>`;
+            } else if (listingUiState === "no_data") {
+              listingsMarkup = `<div class="empty emptyStateError">No StubHub listings match the current filter for this event.</div>`;
+            } else {
+              listingsMarkup = previewListings
+                .map((listing) => {
+                  const metaParts = [listing.availability, listing.notes].filter(Boolean);
+                  return `
+                    <div class="listingRowCompact">
+                      <div>
+                        <div class="listingRowName">${escapeHtml(listing.lot_name)}</div>
+                        ${metaParts.length ? `<div class="listingRowMeta">${escapeHtml(metaParts.join(" • "))}</div>` : ""}
                       </div>
-                    `;
-                  })
-                  .join("")
-              : `<div class="empty">No StubHub listings match the current filter for this event.</div>`;
+                      <div class="listingRowPrice">${escapeHtml(listing.price_display || "")}</div>
+                    </div>
+                  `;
+                })
+                .join("");
+            }
 
             const totalCount = Number(card.listing_count || 0);
             const shownCount = visibleListings.length;
@@ -1444,9 +1518,13 @@
             const dateLabel = [card.day_of_week || "", card.formatted_date || ""].filter(Boolean).join(" ");
             const venueLocation = [card.venue_name || "", card.location || ""].filter(Boolean).join(" • ");
             const previewNote =
-              visibleListings.length > previewListings.length
+              listingUiState === "has_data" && visibleListings.length > previewListings.length
                 ? `<span class="pill">Showing ${previewListings.length} of ${visibleListings.length}</span>`
                 : "";
+            const statusBadgeMarkup =
+              listingUiState === "loading" || listingUiState === "queued" || listingUiState === "no_data"
+                ? ""
+                : `<span class="scrapeBadge ${escapeHtml(card.scrape_state || "queued")}">${escapeHtml(card.scrape_label || "Queued for listing scrape")}</span>`;
 
             return `
               <section class="eventCard">
@@ -1468,7 +1546,7 @@
                   <div class="listingListCompact">${listingsMarkup}</div>
                   <div class="eventFooter">
                     <div class="eventSummaryBar">
-                      <span class="scrapeBadge ${escapeHtml(card.scrape_state || "queued")}">${escapeHtml(card.scrape_label || "Queued for listing scrape")}</span>
+                      ${statusBadgeMarkup}
                       ${previewNote}
                     </div>
                     <div class="eventActionButtons">
@@ -1545,7 +1623,7 @@
         return {
           ...resolvedCard,
           scrape_state: resolvedCard.scrape_state || "done",
-          scrape_label: resolvedCard.scrape_label || (listingCount > 0 ? `Loaded ${listingCount} listings` : "No listings available"),
+          scrape_label: resolvedCard.scrape_label || (listingCount > 0 ? `Loaded ${listingCount} listings` : "No data"),
         };
       }
 

@@ -110,6 +110,39 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             return True
         return False
 
+    @classmethod
+    def _has_real_inventory_signals(cls, rows: list[dict]) -> bool:
+        return any(cls._has_real_inventory_signal(row) for row in rows or [])
+
+    @staticmethod
+    def _dedupe_preserve_order(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key = re.sub(r"\s+", " ", text).strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(text)
+        return result
+
+    @staticmethod
+    def _looks_like_noise_text(value: str | None) -> bool:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if not text:
+            return True
+        patterns = [
+            r"^\d+\s+listings?$",
+            r"^showing\s+\d+\s+of\s+\d+$",
+            r"^show more$",
+            r"^open parking event on stubhub$",
+            r"^stubhub$",
+        ]
+        return any(re.fullmatch(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
     @staticmethod
     def _listing_identifier(row: dict) -> str | None:
         for key in ["listing_id", "inventory_id", "listing_key", "id"]:
@@ -388,6 +421,8 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
     async def _count_visible_listing_nodes(self) -> int:
         selectors = [
+            '[data-testid="listings-container"] [data-listing-id]',
+            '#listings-container [data-listing-id]',
             'div[role="button"].sc-194s59m-4',
             '[data-testid*="listing"]',
             'div[data-listing-id]',
@@ -400,6 +435,176 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             except Exception:
                 continue
         return max_count
+
+    async def _inspect_listing_page_state(self) -> dict:
+        try:
+            return await self.page.evaluate(
+                """() => {
+                    const normalizeText = (value) => (value || '').replace(/\s+/g, ' ').trim();
+                    const parseCount = (value) => {
+                        const match = normalizeText(value).match(/(\d+)/);
+                        return match ? Number(match[1]) : 0;
+                    };
+                    const isNoiseText = (value) => {
+                        const text = normalizeText(value);
+                        if (!text) return true;
+                        return [
+                            /^\d+\s+listings?$/i,
+                            /^showing\s+\d+\s+of\s+\d+$/i,
+                            /^show more$/i,
+                            /^open parking event on stubhub$/i,
+                            /^stubhub$/i,
+                        ].some((pattern) => pattern.test(text));
+                    };
+                    const findListingsContainer = () => {
+                        const explicit =
+                            document.querySelector('[data-testid="listings-container"]')
+                            || document.querySelector('#listings-container');
+                        if (explicit) return explicit;
+                        const listingNodes = Array.from(document.querySelectorAll('[data-listing-id]'));
+                        if (!listingNodes.length) return null;
+                        const scored = new Map();
+                        for (const node of listingNodes) {
+                            let parent = node.parentElement;
+                            for (let depth = 0; parent && depth < 6; depth += 1, parent = parent.parentElement) {
+                                const count = parent.querySelectorAll('[data-listing-id]').length;
+                                if (count < 2) continue;
+                                const score = count * 10 - depth;
+                                const prev = scored.get(parent) || -1;
+                                if (score > prev) scored.set(parent, score);
+                            }
+                        }
+                        let best = null;
+                        let bestScore = -1;
+                        for (const [node, score] of scored.entries()) {
+                            if (score > bestScore) {
+                                best = node;
+                                bestScore = score;
+                            }
+                        }
+                        return best;
+                    };
+                    const findListingNodes = (container) => {
+                        if (!container) return [];
+                        return Array.from(container.querySelectorAll('[data-listing-id]')).filter((node) => {
+                            const listingId = node.getAttribute('data-listing-id') || node.dataset?.listingId || '';
+                            if (!listingId) return false;
+                            const rawPrice = normalizeText(node.getAttribute('data-price') || node.dataset?.price || '');
+                            const hasVisiblePrice = Array.from(node.querySelectorAll('[data-price], div, span, p, strong'))
+                                .some((el) => /[$€£R]\s?[0-9,.]+|[A-Z]{2,3}\s?[0-9,.]+/.test(normalizeText(el.getAttribute?.('data-price') || el.dataset?.price || el.textContent)));
+                            const heading = normalizeText(node.querySelector('h3, [role="heading"]')?.textContent || '');
+                            const hasCta = !!node.querySelector('button, a[href], [role="button"]');
+                            return !!listingId && (!!rawPrice || hasVisiblePrice) && (!!heading || hasCta);
+                        });
+                    };
+                    const collectExactTexts = (selector) => Array.from(document.querySelectorAll(selector))
+                        .map((el) => normalizeText(el.textContent || ''))
+                        .filter(Boolean);
+                    const explicitContainer =
+                        document.querySelector('[data-testid="listings-container"]')
+                        || document.querySelector('#listings-container');
+                    const container = explicitContainer || findListingsContainer();
+                    const validNodes = findListingNodes(container);
+                    const exactTexts = collectExactTexts('button, a, [role="button"], h1, h2, h3, h4, h5, p, span, strong, small');
+                    const explicitEmptyState = exactTexts.some((text) => [
+                        /sorry,\s+there are no tickets available for this event/i,
+                        /notify me when tickets are available/i,
+                        /no tickets available for this event/i,
+                    ].some((pattern) => pattern.test(text)));
+                    const showingText = exactTexts.find((text) => /^showing\s+\d+\s+of\s+\d+$/i.test(text)) || '';
+                    const listingCountText = exactTexts.find((text) => /^\d+\s+listings?$/i.test(text)) || '';
+                    const showingMatch = showingText.match(/showing\s+(\d+)\s+of\s+(\d+)/i);
+                    const listingCountMatch = listingCountText.match(/(\d+)\s+listings?/i);
+                    const showMoreVisible = exactTexts.some((text) => /^show more$/i.test(text));
+                    const visibleCount = validNodes.length;
+                    let totalCount = 0;
+                    if (showingMatch) {
+                        totalCount = parseCount(showingMatch[2]);
+                    } else if (listingCountMatch) {
+                        totalCount = parseCount(listingCountMatch[1]);
+                    } else {
+                        totalCount = visibleCount;
+                    }
+                    const pageState = visibleCount > 0
+                        ? ((showMoreVisible || totalCount > visibleCount) ? 'partial' : 'has_listings')
+                        : ((!!explicitContainer && explicitEmptyState) ? 'no_data' : 'unknown');
+                    return {
+                        pageState,
+                        hasListingsContainer: !!container,
+                        hasExplicitListingsContainer: !!explicitContainer,
+                        visibleListingNodes: visibleCount,
+                        totalCount,
+                        explicitEmptyState,
+                        hasShowMore: showMoreVisible,
+                    };
+                }"""
+            )
+        except Exception:
+            return {
+                "pageState": "unknown",
+                "hasListingsContainer": False,
+                "hasExplicitListingsContainer": False,
+                "visibleListingNodes": 0,
+                "totalCount": 0,
+                "explicitEmptyState": False,
+                "hasShowMore": False,
+            }
+
+    async def _detect_early_no_data(self) -> dict:
+        try:
+            return await self.page.evaluate(
+                """() => {
+                    const normalizeText = (value) => (value || '').replace(/\s+/g, ' ').trim();
+                    const container =
+                        document.querySelector('[data-testid="listings-container"]')
+                        || document.querySelector('#listings-container');
+                    const listingNodes = container ? container.querySelectorAll('[data-listing-id]') : [];
+                    if (listingNodes.length > 0) {
+                        return {
+                            isNoData: false,
+                            hasNoTicketsMessage: false,
+                            hasZeroCount: false,
+                            hasListingsContainer: true,
+                            listingNodeCount: listingNodes.length,
+                        };
+                    }
+                    const exactTexts = Array.from(document.querySelectorAll('button, a, [role="button"], h1, h2, h3, h4, h5, p, span, strong, small'))
+                        .map((el) => normalizeText(el.textContent || ''))
+                        .filter(Boolean);
+                    const hasNoTicketsMessage = exactTexts.some((text) => /no tickets available|sorry, there are no tickets/i.test(text));
+                    const hasZeroCount = exactTexts.some((text) => /^showing\s*0\s*of\s*0$/i.test(text));
+                    const isNoData = !!(hasNoTicketsMessage && hasZeroCount && listingNodes.length === 0);
+                    return {
+                        isNoData,
+                        hasNoTicketsMessage,
+                        hasZeroCount,
+                        hasListingsContainer: !!container,
+                        listingNodeCount: listingNodes.length,
+                    };
+                }"""
+            )
+        except Exception:
+            return {
+                "isNoData": False,
+                "hasNoTicketsMessage": False,
+                "hasZeroCount": False,
+                "hasListingsContainer": False,
+                "listingNodeCount": 0,
+            }
+
+    async def _wait_for_listing_cards_before_empty_check(self, timeout_ms: int = 5000, poll_ms: int = 200) -> str:
+        started_at = time.perf_counter()
+        while (time.perf_counter() - started_at) * 1000 < timeout_ms:
+            try:
+                page_state = await self._inspect_listing_page_state()
+                if int(page_state.get("visibleListingNodes") or 0) > 0:
+                    return "HAS_LISTINGS"
+                if page_state.get("pageState") == "no_data":
+                    return "NO_DATA"
+            except Exception:
+                pass
+            await asyncio.sleep(max(0.05, poll_ms / 1000))
+        return "TIMEOUT"
 
     @classmethod
     def _detect_empty_inventory_text(cls, text: str | None) -> str | None:
@@ -503,21 +708,18 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
     async def _wait_for_listings(self, timeout_ms: int = 20000) -> bool:
         """Wait for listing elements or listing count to appear."""
-        selectors = [
-            'div[role="button"].sc-194s59m-4',
-            '[data-testid*="listing"]',
-            'h3',
-            'div:contains("listings")',
-            'div:contains("passes")'
-        ]
-        start = asyncio.get_event_loop().time()
-        while (asyncio.get_event_loop().time() - start) * 1000 < timeout_ms:
-            for s in selectors:
-                try:
-                    if await self.page.locator(s).count() > 0:
-                        return True
-                except Exception:
-                    continue
+        started_at = time.perf_counter()
+        while (time.perf_counter() - started_at) * 1000 < timeout_ms:
+            try:
+                page_state = await self._inspect_listing_page_state()
+                if int(page_state.get("visibleListingNodes") or 0) > 0:
+                    return True
+                if page_state.get("pageState") == "no_data":
+                    return False
+                if page_state.get("hasListingsContainer") and int(page_state.get("totalCount") or 0) > 0:
+                    return True
+            except Exception:
+                pass
             await asyncio.sleep(1)
         return False
 
@@ -527,8 +729,245 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         wait_timeout_ms: int | None = None,
         capture_debug_screenshot: bool = False,
     ) -> list[dict]:
+        async def _extract_from_listing_container(ctx) -> list[dict]:
+            try:
+                rows = await ctx.evaluate(
+                    """() => {
+                        const normalizeText = (value) => (value || '').replace(/\s+/g, ' ').trim();
+                        const normalizeKey = (value) => normalizeText(value).toLowerCase();
+                        const dedupe = (values) => {
+                            const out = [];
+                            const seen = new Set();
+                            for (const value of values || []) {
+                                const text = normalizeText(value);
+                                if (!text) continue;
+                                const key = text.toLowerCase();
+                                if (seen.has(key)) continue;
+                                seen.add(key);
+                                out.push(text);
+                            }
+                            return out;
+                        };
+                        const isPriceText = (value) => /^[$€£R]\s?[0-9,.]+$/.test(value || '') || /^[A-Z]{2,3}\s?[0-9,.]+$/.test(value || '');
+                        const isPassCountText = (value) => /^\d+\s*(?:-\s*\d+\s*)?pass(?:es)?$/i.test(normalizeText(value));
+                        const isRatingLabel = (value) => /^(Amazing|Great|Good)$/i.test(normalizeText(value));
+                        const isRatingScore = (value) => /^\d+(?:\.\d+)?$/.test(normalizeText(value));
+                        const isListingsHeader = (value) => /^\d+\s+listings?$/i.test(normalizeText(value));
+                        const isNoiseText = (value) => {
+                            const text = normalizeText(value);
+                            if (!text) return true;
+                            return [
+                                /^\d+\s+listings?$/i,
+                                /^showing\s+\d+\s+of\s+\d+$/i,
+                                /^show more$/i,
+                                /^open parking event on stubhub$/i,
+                                /^stubhub$/i,
+                            ].some((pattern) => pattern.test(text));
+                        };
+                        const findListingsContainer = () => {
+                            const explicit =
+                                document.querySelector('[data-testid="listings-container"]')
+                                || document.querySelector('#listings-container');
+                            if (explicit) return explicit;
+                            const listingNodes = Array.from(document.querySelectorAll('[data-listing-id]'));
+                            if (!listingNodes.length) return null;
+                            const scored = new Map();
+                            for (const node of listingNodes) {
+                                let parent = node.parentElement;
+                                for (let depth = 0; parent && depth < 6; depth += 1, parent = parent.parentElement) {
+                                    const count = parent.querySelectorAll('[data-listing-id]').length;
+                                    if (count < 2) continue;
+                                    const score = count * 10 - depth;
+                                    const prev = scored.get(parent) || -1;
+                                    if (score > prev) scored.set(parent, score);
+                                }
+                            }
+                            let best = null;
+                            let bestScore = -1;
+                            for (const [node, score] of scored.entries()) {
+                                if (score > bestScore) {
+                                    best = node;
+                                    bestScore = score;
+                                }
+                            }
+                            return best;
+                        };
+                        const findListingNodes = (container) => {
+                            if (!container) return [];
+                            return Array.from(container.querySelectorAll('[data-listing-id]')).filter((node) => {
+                                const listingId = node.getAttribute('data-listing-id') || node.dataset?.listingId || '';
+                                if (!listingId) return false;
+                                const rawPrice = node.getAttribute('data-price') || node.dataset?.price || '';
+                                const hasVisiblePrice = Array.from(node.querySelectorAll('[data-price], div, span, p, strong'))
+                                    .some((el) => isPriceText(normalizeText(el.getAttribute?.('data-price') || el.dataset?.price || el.textContent)));
+                                const heading = normalizeText(node.querySelector('h3, [role="heading"]')?.textContent || '');
+                                const hasCta = !!node.querySelector('button, a[href], [role="button"]');
+                                return !!listingId && (!!rawPrice || hasVisiblePrice) && (!!heading || hasCta);
+                            });
+                        };
+                        const collectScopedTexts = (node, selectors) => {
+                            const values = [];
+                            for (const selector of selectors) {
+                                for (const el of Array.from(node.querySelectorAll(selector))) {
+                                    if (el.closest('[data-listing-id]') !== node) continue;
+                                    const text = normalizeText(el.textContent || '');
+                                    if (!text || isNoiseText(text)) continue;
+                                    values.push(text);
+                                }
+                            }
+                            return dedupe(values);
+                        };
+                        const extractTitle = (node) => {
+                            const heading = node.querySelector('h3, [role="heading"]');
+                            const text = normalizeText(heading?.textContent || '');
+                            if (!text || isNoiseText(text) || isListingsHeader(text)) {
+                                return '';
+                            }
+                            return text;
+                        };
+                        const extractPassCount = (node) => {
+                            const directNode =
+                                node.querySelector('.sc-1t1b4cp-12')
+                                || node.querySelector('[data-testid*="pass"]')
+                                || null;
+                            const directText = normalizeText(directNode?.textContent || '');
+                            if (isPassCountText(directText)) {
+                                return directText.replace(/\s*•\s*.*/, '');
+                            }
+                            const passCounts = collectScopedTexts(node, ['span', 'p', 'small'])
+                                .filter((text) => isPassCountText(text))
+                                .map((text) => text.replace(/\s*•\s*.*/, ''));
+                            return passCounts[0] || '';
+                        };
+                        const extractPrice = (node) => {
+                            const attrPrice = normalizeText(
+                                node.getAttribute('data-price')
+                                || node.dataset?.price
+                                || ''
+                            );
+                            if (attrPrice && isPriceText(attrPrice) && attrPrice !== '$1') {
+                                return attrPrice;
+                            }
+                            const candidates = Array.from(node.querySelectorAll('[data-price], .sc-1t1b4cp-1, span, p, strong'))
+                                .filter((el) => el.closest('[data-listing-id]') === node)
+                                .map((el) => normalizeText(
+                                    el.getAttribute?.('data-price')
+                                    || el.dataset?.price
+                                    || el.textContent
+                                ))
+                                .filter((text) => isPriceText(text) && text !== '$1');
+                            return dedupe(candidates)[0] || '';
+                        };
+                        const extractRating = (node) => {
+                            const ratingTexts = collectScopedTexts(node, ['span', 'p', 'small', '[class*="Amazing"]', '[class*="Great"]', '[class*="Good"]']);
+                            const texts = ratingTexts.filter((text) => !isPassCountText(text) && !isPriceText(text));
+                            const ratingScore = texts.find((text) => isRatingScore(text) && Number(text) <= 10) || '';
+                            const ratingLabel = texts.find((text) => isRatingLabel(text)) || '';
+                            return { ratingScore, ratingLabel };
+                        };
+                        const extractBadges = (node, title, passCount, price, ratingScore, ratingLabel) => {
+                            const badgeTexts = collectScopedTexts(node, ['.sc-wnalz8-3', '.sc-wnalz8-2', 'small', 'li', 'p', 'span']);
+                            const ignored = new Set(
+                                [title, passCount, price, ratingScore, ratingLabel]
+                                    .map((value) => normalizeText(value))
+                                    .filter(Boolean)
+                                    .map((value) => normalizeKey(value))
+                            );
+                            const badges = [];
+                            for (const text of badgeTexts) {
+                                const normalized = normalizeText(text);
+                                if (!normalized) continue;
+                                const key = normalizeKey(normalized);
+                                if (ignored.has(key)) continue;
+                                if (isPriceText(normalized) || isPassCountText(normalized) || isRatingLabel(normalized) || isRatingScore(normalized)) continue;
+                                if (isListingsHeader(normalized)) continue;
+                                if (isNoiseText(normalized)) continue;
+                                if (/^buy$/i.test(normalized)) continue;
+                                badges.push(normalized);
+                            }
+                            return dedupe(badges);
+                        };
+                        const validateListing = (listing) => {
+                            const title = normalizeText(listing.title);
+                            const price = normalizeText(listing.price);
+                            const listingId = normalizeText(listing.listingId);
+                            if (!listingId || !price) return false;
+                            if (title && isNoiseText(title)) return false;
+                            return !!(title || listingId);
+                        };
+
+                        const container = findListingsContainer();
+                        if (!container) {
+                            return [];
+                        }
+                        const cards = findListingNodes(container);
+                        return cards.map((node) => {
+                            const listingId =
+                                node.getAttribute('data-listing-id')
+                                || node.getAttribute('data-listingid')
+                                || node.dataset?.listingId
+                                || null;
+                            const title = extractTitle(node);
+                            const passCount = extractPassCount(node);
+                            const price = extractPrice(node);
+                            const { ratingScore, ratingLabel } = extractRating(node);
+                            const badges = extractBadges(node, title, passCount, price, ratingScore, ratingLabel);
+                            const listing = { listingId, title, passCount, price, ratingScore, ratingLabel, badges };
+                            return validateListing(listing) ? listing : null;
+                        }).filter(Boolean);
+                    }"""
+                )
+            except Exception:
+                rows = []
+
+            passes: list[dict] = []
+            seen: set[str] = set()
+            for row in rows or []:
+                listing_id = row.get("listingId")
+                if not listing_id:
+                    continue
+                title = str(row.get("title") or "").strip()
+                price_text = self._normalize_price_text_display(str(row.get("price") or "").strip()) or ""
+                if not title and not price_text:
+                    continue
+                price = self._numeric_price(price_text) if price_text else None
+                if not price and price_text:
+                    price = self._normalize_raw_price(price_text)
+                if not price:
+                    continue
+                pass_count = str(row.get("passCount") or "").strip()
+                badges = self._dedupe_preserve_order([str(item or "").strip() for item in (row.get("badges") or [])])
+                rating_score = str(row.get("ratingScore") or "").strip()
+                rating_label = str(row.get("ratingLabel") or "").strip()
+                dedup_key = str(listing_id)
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                passes.append(
+                    {
+                        "lot_name": title or f"Listing {listing_id}",
+                        "normalized_lot_name": normalize_lot_name(title or f"Listing {listing_id}"),
+                        "price": str(price).replace(",", ""),
+                        "currency": self._currency_from_text(price_text),
+                        "availability": pass_count,
+                        "listing_id": listing_id,
+                        "_source": "dom_container",
+                        "listing_details": {
+                            "title": title or f"Listing {listing_id}",
+                            "price_incl_fees": price_text or f"${price}",
+                            "availability": pass_count,
+                            "rating": rating_label,
+                            "ratingScore": rating_score,
+                            "badges": badges,
+                            "notes": " | ".join(badges) if badges else None,
+                        },
+                    }
+                )
+            return passes
+
         async def _extract_from_context(ctx) -> list[dict]:
             selectors = [
+                '[data-testid="listings-container"] [data-listing-id]',
                 'div[role="button"].sc-194s59m-4',
                 '[data-testid*="listing"]',
                 'div[data-listing-id]',
@@ -672,6 +1111,19 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             except Exception as e:
                 logger.warning(f"[Scraper] Failed to save debug screenshot: {e}")
 
+        passes = await _extract_from_listing_container(self.page)
+        logger.info(f"[Scraper] Container extraction found {len(passes or [])} passes")
+        if passes:
+            return passes
+
+        container_state = await self._inspect_listing_page_state()
+        if container_state.get("hasListingsContainer") or int(container_state.get("visibleListingNodes") or 0) > 0:
+            logger.info(
+                "[Scraper] Structured StubHub listing container detected but card extraction returned no rows; "
+                "skipping broad DOM text fallbacks to avoid merged listing corruption."
+            )
+            return []
+
         passes = await _extract_from_context(self.page)
         logger.info(f"[Scraper] DOM extraction found {len(passes or [])} passes")
         if passes:
@@ -680,6 +1132,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         for frame in self.page.frames:
             if frame == self.page.main_frame:
                 continue
+            try:
+                passes = await _extract_from_listing_container(frame)
+            except Exception:
+                passes = []
+            if passes:
+                return passes
             try:
                 passes = await _extract_from_context(frame)
             except Exception:
@@ -1159,15 +1617,14 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 logger.info(f"[Scraper] Navigation complete. Waiting for stabilization...")
                 await asyncio.sleep(0.75)
 
-                body_text = ""
-                empty_inventory_reason = None
-                try:
-                    body_text = await self.page.evaluate("""() => document.body.innerText || ''""")
-                    empty_inventory_reason = self._detect_empty_inventory_text(body_text)
-                except Exception:
-                    body_text = ""
+                listing_wait_result = await self._wait_for_listing_cards_before_empty_check(timeout_ms=6000, poll_ms=200)
+                if listing_wait_result == "HAS_LISTINGS":
+                    logger.info(f"[Scraper] Listing cards detected before empty-state check for {self.page.url}")
+                elif listing_wait_result == "NO_DATA":
+                    logger.info(f"[Scraper] Render wait confirmed no-data state for {self.page.url}")
 
-                if empty_inventory_reason:
+                early_no_data = await self._detect_early_no_data() if listing_wait_result != "HAS_LISTINGS" else {"isNoData": False}
+                if early_no_data.get("isNoData"):
                     probe = {
                         "attempt": label,
                         "url": self.page.url,
@@ -1182,20 +1639,56 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "xhr_passes": 0,
                         "merged_passes": 0,
                         "empty_inventory": True,
-                        "empty_inventory_reason": empty_inventory_reason,
+                        "empty_inventory_reason": "confirmed_early_no_data",
+                        "page_state": "no_data",
+                        "visible_listing_nodes": 0,
+                        "total_listing_count": 0,
                     }
-                    logger.info(f"[Scraper] Empty inventory page detected for {self.page.url}: {empty_inventory_reason}")
+                    logger.info(
+                        f"[Scraper] Early no-data detection triggered for {self.page.url}: "
+                        f"listingWaitResult={listing_wait_result}, "
+                        f"hasNoTicketsMessage={early_no_data.get('hasNoTicketsMessage')}, "
+                        f"hasZeroCount={early_no_data.get('hasZeroCount')}, "
+                        f"listingNodeCount={early_no_data.get('listingNodeCount')}"
+                    )
                     return [], probe
 
-                visible_before_expand = 0
-                has_listing_count = bool(re.search(r"\b\d+\s+listings\b", body_text, flags=re.IGNORECASE))
-                try:
-                    visible_before_expand = await self._count_visible_listing_nodes()
-                except Exception:
-                    visible_before_expand = 0
+                page_state = await self._inspect_listing_page_state()
+                visible_before_expand = int(page_state.get("visibleListingNodes") or 0)
+                has_listing_count = int(page_state.get("totalCount") or 0) > 0
 
                 state_passes = await self._extract_passes_from_state()
                 embedded_passes = await self._extract_passes_from_embedded_json()
+
+                preliminary_passes = self._filter_telemetry_rows(
+                    self._merge_pass_collections(state_passes, embedded_passes)
+                )
+                if page_state.get("pageState") == "no_data" and not self._has_real_inventory_signals(preliminary_passes):
+                    probe = {
+                        "attempt": label,
+                        "url": self.page.url,
+                        "title": (await self.page.title()),
+                        "captured_payloads": len(captured_payloads),
+                        "captured_urls": captured_urls[:5],
+                        "captured_request_payloads": len(captured_request_payloads),
+                        "captured_request_urls": captured_request_urls[:5],
+                        "dom_passes": 0,
+                        "state_passes": len(state_passes),
+                        "embedded_passes": len(embedded_passes),
+                        "xhr_passes": 0,
+                        "merged_passes": 0,
+                        "empty_inventory": True,
+                        "empty_inventory_reason": "explicit_empty_state",
+                        "page_state": page_state.get("pageState"),
+                        "visible_listing_nodes": visible_before_expand,
+                        "total_listing_count": int(page_state.get("totalCount") or 0),
+                    }
+                    logger.info(
+                        f"[Scraper] Explicit empty listing state detected for {self.page.url}; "
+                        f"page_state={page_state.get('pageState')}, visible_nodes={visible_before_expand}, "
+                        f"state_passes={len(state_passes)}, embedded_passes={len(embedded_passes)}"
+                    )
+                    return [], probe
 
                 should_expand_inventory = not (visible_before_expand >= 3 or state_passes or embedded_passes)
                 dom_wait_timeout_ms = (
@@ -1260,6 +1753,9 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "merged_passes": 0,
                         "empty_inventory": True,
                         "empty_inventory_reason": "no_real_listing_signals",
+                        "page_state": page_state.get("pageState"),
+                        "visible_listing_nodes": int(page_state.get("visibleListingNodes") or 0),
+                        "total_listing_count": int(page_state.get("totalCount") or 0),
                     }
                     logger.info(
                         f"[Scraper] No real listing signals detected for {self.page.url}; "
@@ -1283,6 +1779,9 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "xhr_passes": len(xhr_passes),
                     "merged_passes": len(passes),
                     "empty_inventory": False,
+                    "page_state": page_state.get("pageState"),
+                    "visible_listing_nodes": int(page_state.get("visibleListingNodes") or 0),
+                    "total_listing_count": int(page_state.get("totalCount") or 0),
                 }
                 return passes, probe
             finally:

@@ -1323,11 +1323,11 @@ def _client_search_scrape_label(card: dict, errors: list[dict] | None = None) ->
             continue
         probe = error.get("probe") if isinstance(error.get("probe"), dict) else {}
         if probe.get("empty_inventory"):
-            return "No listings available"
+            return "No data"
         if str(error.get("error") or "").strip() == "No parking listings extracted":
-            return "No listings available"
+            return "No data"
 
-    return "No listings available"
+    return "No data"
 
 
 def _client_search_payload_from_request_payload(payload: dict) -> dict:
