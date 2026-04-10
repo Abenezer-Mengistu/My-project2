@@ -43,21 +43,251 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
         parts = [
             row.get("normalized_lot_name") or row.get("lot_name") or "",
-            row.get("price") or "",
+            StubHubParkingScraper._price_identity_token(str(row.get("price") or "")),
             row.get("availability") or "",
             details.get("price_incl_fees") or "",
             details.get("notes") or "",
             details.get("title") or "",
+            details.get("listingId") or "",
+            details.get("inventoryId") or "",
+            details.get("listingKey") or "",
             row.get("_source") or "",
         ]
         return "|".join(str(part).strip() for part in parts)
+
+    @staticmethod
+    def _is_stubhub_ui_chaff_lot_name(value: str | None) -> bool:
+        """Labels from column headers / chips / ratings — not a parking lot title."""
+        text = (value or "").strip()
+        if not text:
+            return True
+        lower = text.lower()
+        if re.fullmatch(r"price\s+per\s+pass", lower):
+            return True
+        if re.fullmatch(r"parking\s+pass(?:es)?", lower):
+            return True
+        if re.fullmatch(r"parking(?:\s+listing)?", lower):
+            return True
+        if re.fullmatch(r"incl\.?\s*fees", lower):
+            return True
+        if re.fullmatch(r"(amazing|great|good|poor)", lower):
+            return True
+        if re.fullmatch(r"\d{1,2}\.\d", lower):
+            return True
+        if re.fullmatch(r"\d+%\s*off", lower):
+            return True
+        if re.fullmatch(r"only\s+\d+\s+left", lower):
+            return True
+        if re.fullmatch(r"last\s+pass(?:es)?", lower):
+            return True
+        if re.fullmatch(r"\d+\s+listings?", lower):
+            return True
+        if re.fullmatch(r"each", lower):
+            return True
+        return False
+
+    @staticmethod
+    def _is_stubhub_ui_chaff_line(line: str) -> bool:
+        s = (line or "").strip()
+        if not s:
+            return True
+        if StubHubParkingScraper._is_stubhub_ui_chaff_lot_name(s):
+            return True
+        if re.fullmatch(r"\d+\s*(?:-|to)\s*\d+\s*passes?", s, flags=re.IGNORECASE):
+            return True
+        if re.fullmatch(r"\d+\s*pass(?:es)?", s, flags=re.IGNORECASE):
+            return True
+        if re.fullmatch(r"[$€£R]\s*[\d,]+(?:\.\d{2})?\+?", s):
+            return True
+        if re.search(r"buyer could receive", s, flags=re.IGNORECASE):
+            return True
+        return False
+
+    @staticmethod
+    def _dom_pick_lot_name(title: str | None, lines: list[str]) -> str | None:
+        for raw in lines:
+            s = raw.strip()
+            if re.match(r"^Lot\s+\d+\b", s, flags=re.IGNORECASE):
+                return s[:120]
+        for raw in lines:
+            s = raw.strip()
+            if re.match(r"^Private\s+Lots?\b", s, flags=re.IGNORECASE):
+                return s[:120]
+        t = (title or "").strip()
+        if t and not StubHubParkingScraper._is_stubhub_ui_chaff_lot_name(t):
+            return t[:120]
+        for raw in lines:
+            s = raw.strip()
+            if not s or len(s) > 200:
+                continue
+            if StubHubParkingScraper._is_stubhub_ui_chaff_line(s):
+                continue
+            if StubHubParkingScraper._is_stubhub_ui_chaff_lot_name(s):
+                continue
+            return s[:120]
+        return None
+
+    @staticmethod
+    def _currency_amounts_in_order(text: str) -> list[tuple[str, float]]:
+        out: list[tuple[str, float]] = []
+        for sym, code in (("$", "USD"), ("€", "EUR"), ("£", "GBP")):
+            for m in re.finditer(re.escape(sym) + r"\s*([\d,]+(?:\.\d{1,2})?)\+?", text):
+                raw = m.group(1).replace(",", "")
+                try:
+                    out.append((code, float(raw)))
+                except ValueError:
+                    continue
+        return out
+
+    @staticmethod
+    def _primary_price_value_from_card_text(text: str) -> tuple[str | None, str | None]:
+        """
+        Pick the price the buyer pays when the card shows crossed + sale, or a single price.
+        Returns (normalized_price_string, currency_code_or_empty).
+        """
+        amounts = StubHubParkingScraper._currency_amounts_in_order(text or "")
+        if not amounts:
+            return None, None
+        codes = {c for c, _ in amounts}
+        primary_code = amounts[0][0] if len(codes) == 1 else "USD"
+        same = [v for c, v in amounts if c == primary_code]
+        if not same:
+            same = [v for _, v in amounts]
+        lower = (text or "").lower()
+        discounted = bool(re.search(r"\d+\s*%\s*off", lower)) or ("% off" in lower)
+        if len(same) >= 2 and discounted:
+            pick = min(same)
+        elif len(same) >= 2:
+            pick = same[-1]
+        else:
+            pick = same[0]
+        return f"{pick:.2f}", primary_code
+
+    @staticmethod
+    def _price_identity_token(value: str | None) -> str:
+        """Stable token for deduping fallback merge keys (125 vs 125.00)."""
+        p = StubHubParkingScraper._numeric_price(str(value or ""))
+        if not p:
+            return ""
+        if "." not in p:
+            return f"{p}.00"
+        a, _, b = p.partition(".")
+        b = (b + "00")[:2]
+        return f"{a}.{b}"
+
+    @staticmethod
+    def _is_bundle_extracted_source(src: str | None) -> bool:
+        s = str(src or "")
+        return bool(
+            s == "payload_json"
+            or "payload_json" in s
+            or "embedded_xhr" in s
+            or "embedded_html" in s
+        )
 
     @staticmethod
     def _is_generic_lot_name(value: str | None) -> bool:
         text = (value or "").strip()
         if not text:
             return True
-        return bool(re.fullmatch(r"(Section\s+\d+|Listing\s+\d+)", text, flags=re.IGNORECASE))
+        if StubHubParkingScraper._is_stubhub_ui_chaff_lot_name(text):
+            return True
+        if re.fullmatch(r"(Section\s+\d+|Listing\s+\d+)", text, flags=re.IGNORECASE):
+            return True
+        # Distance-only/location-only placeholders are not useful lot names.
+        if re.fullmatch(r"Within\s+\d+(?:\.\d+)?\s*(?:mi|km)", text, flags=re.IGNORECASE):
+            return True
+        if re.fullmatch(r"\d+\s*(?:-|to)\s*\d+\s*passes?", text, flags=re.IGNORECASE):
+            return True
+        if re.fullmatch(r"\d+\s*min(?:ute)?s?\s+walk", text, flags=re.IGNORECASE):
+            return True
+        return False
+
+    @staticmethod
+    def _is_raw_section_idish(value: str | None) -> bool:
+        """Bare numeric StubHub section id (not a human title like 'Lot 6')."""
+        text = (value or "").strip()
+        if not text:
+            return False
+        return bool(re.fullmatch(r"\d{4,12}", text))
+
+    @staticmethod
+    def _inventory_display_name_candidates(obj: dict) -> list[str]:
+        keys = [
+            "listingTitle",
+            "parkingTitle",
+            "inventoryTitle",
+            "ticketClassName",
+            "zoneName",
+            "name",
+            "sectionName",
+        ]
+        out: list[str] = []
+
+        def _push(v) -> None:
+            if v is None or isinstance(v, (dict, list)):
+                return
+            s = str(v).strip()
+            if s:
+                out.append(s)
+
+        for k in keys:
+            _push(obj.get(k))
+        for nest_key in ("parking", "location", "inventory"):
+            sub = obj.get(nest_key)
+            if isinstance(sub, dict):
+                for k in keys:
+                    _push(sub.get(k))
+        return out
+
+    @staticmethod
+    def _pick_display_lot_name_from_inventory(obj: dict) -> str | None:
+        """
+        Prefer human-facing titles (e.g. Lot 6) over internal Section / numeric ids.
+        """
+        cands = StubHubParkingScraper._inventory_display_name_candidates(obj)
+        if not cands:
+            return None
+        return sorted(cands, key=StubHubParkingScraper._lot_name_quality_score, reverse=True)[0]
+
+    @staticmethod
+    def _lot_name_quality_score(value: str | None) -> int:
+        text = (value or "").strip()
+        if not text:
+            return -100
+        lower = text.lower()
+        score = 0
+        if StubHubParkingScraper._is_raw_section_idish(text):
+            score -= 30
+        if StubHubParkingScraper._is_generic_lot_name(text):
+            score -= 20
+        # Prefer labels that look like real lot names / addresses.
+        if re.search(r"\b(garage|lot|center|center garage|parking)\b", lower):
+            score += 8
+        if re.search(r"\b(st|street|ave|avenue|blvd|boulevard|dr|drive|rd|road|pl|place)\b", lower):
+            score += 10
+        if re.search(r"\b\d{1,5}\s+[a-z]", lower):
+            score += 8
+        # Distance-only phrasing is weaker than named lots.
+        if re.search(r"\b(within\s+[0-9.]+\s*(mi|km)|[0-9.]+\s*(mi|km)\s+from venue)\b", lower):
+            score -= 8
+        if re.search(r"\b\d+\s*(-|to)\s*\d+\s*passes?\b", lower):
+            score -= 6
+        return score
+
+    @staticmethod
+    def _merge_pick_better_lot_name(name_a: str | None, name_b: str | None) -> str | None:
+        """Prefer higher-quality human-facing lot names."""
+        a, b = (name_a or "").strip(), (name_b or "").strip()
+        if not a:
+            return b or None
+        if not b:
+            return a
+        sa = StubHubParkingScraper._lot_name_quality_score(a)
+        sb = StubHubParkingScraper._lot_name_quality_score(b)
+        if sb > sa:
+            return b
+        return a
 
     @staticmethod
     def _details_score(listing: dict) -> int:
@@ -93,9 +323,12 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 else:
                     preferred, fallback = current, dict(row)
 
-                if StubHubParkingScraper._is_generic_lot_name(preferred.get("lot_name")) and not StubHubParkingScraper._is_generic_lot_name(fallback.get("lot_name")):
-                    preferred["lot_name"] = fallback.get("lot_name")
-                    preferred["normalized_lot_name"] = fallback.get("normalized_lot_name")
+                better = StubHubParkingScraper._merge_pick_better_lot_name(
+                    preferred.get("lot_name"), fallback.get("lot_name")
+                )
+                if better:
+                    preferred["lot_name"] = better
+                    preferred["normalized_lot_name"] = normalize_lot_name(better)
                 if not preferred.get("availability") and fallback.get("availability"):
                     preferred["availability"] = fallback.get("availability")
                 if not preferred.get("price") and fallback.get("price"):
@@ -111,6 +344,11 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         **preferred_details,
                     }
 
+                if better:
+                    merged_d = preferred.get("listing_details") if isinstance(preferred.get("listing_details"), dict) else {}
+                    if StubHubParkingScraper._is_generic_lot_name(str(merged_d.get("title") or "")):
+                        preferred["listing_details"] = {**merged_d, "title": better}
+
                 source_parts = []
                 for source in [current.get("_source"), row.get("_source")]:
                     if source and source not in source_parts:
@@ -125,24 +363,47 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
     def _filter_telemetry_rows(rows: list[dict]) -> list[dict]:
         if not rows:
             return rows
+        return [row for row in rows if StubHubParkingScraper._is_real_listing_row(row)]
 
-        real_rows = [
-            row for row in rows
-            if not StubHubParkingScraper._is_generic_lot_name(row.get("lot_name"))
-            and (row.get("availability") or (row.get("listing_details") or {}).get("availability"))
-        ]
-        if not real_rows:
-            return rows
+    @staticmethod
+    def _has_parseable_price(row: dict) -> bool:
+        direct = StubHubParkingScraper._numeric_price(str(row.get("price") or ""))
+        if direct:
+            return True
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        detail_price = details.get("price_incl_fees") or details.get("price") or details.get("formattedPrice")
+        return bool(StubHubParkingScraper._numeric_price(str(detail_price or "")))
 
-        filtered = []
-        for row in rows:
-            details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
-            if StubHubParkingScraper._is_generic_lot_name(row.get("lot_name")):
-                continue
-            if not row.get("availability") and not details.get("availability") and "embedded_xhr" in str(row.get("_source") or "").lower():
-                continue
-            filtered.append(row)
-        return filtered or real_rows
+    @staticmethod
+    def _is_real_listing_row(row: dict) -> bool:
+        if not isinstance(row, dict):
+            return False
+        lot_name = str(row.get("lot_name") or "").strip()
+        listing_id = StubHubParkingScraper._listing_identifier(row)
+        has_price = StubHubParkingScraper._has_parseable_price(row)
+        if not has_price:
+            return False
+        if listing_id:
+            return True
+        if StubHubParkingScraper._is_stubhub_ui_chaff_lot_name(lot_name):
+            return False
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        src = str(row.get("_source") or "")
+        avail = row.get("availability") or details.get("availability")
+        # HTML/JSON bundle extracts often carry Section ids without listing ids — drop as telemetry.
+        if StubHubParkingScraper._is_bundle_extracted_source(src):
+            if StubHubParkingScraper._is_generic_lot_name(lot_name):
+                return False
+            return bool(lot_name or avail or details.get("notes") or details.get("rating"))
+
+        if StubHubParkingScraper._is_generic_lot_name(lot_name):
+            return bool(avail)
+
+        return bool(
+            lot_name
+            or avail
+            or (details.get("title") or details.get("name"))
+        )
 
     @staticmethod
     def _currency_from_text(price_text: str) -> str:
@@ -315,32 +576,72 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
     @staticmethod
     def _extract_total_listing_count(body_text: str) -> int | None:
-        match = re.search(r"\b([0-9][0-9,]*)\s+listings\b", body_text or "", flags=re.IGNORECASE)
-        if not match:
-            return None
-        try:
-            return int(match.group(1).replace(",", ""))
-        except Exception:
-            return None
+        """Largest 'N listings' in body text (first match alone often hits a smaller UI fragment)."""
+        pat = re.compile(r"\b([0-9][0-9,]*)\s+listings\b", flags=re.IGNORECASE)
+        best: int | None = None
+        for m in pat.finditer(body_text or ""):
+            try:
+                val = int(m.group(1).replace(",", ""))
+            except Exception:
+                continue
+            if val > 1_000_000:
+                continue
+            if best is None or val > best:
+                best = val
+        return best
 
-    async def _load_all_listing_inventory(self) -> None:
-        max_duration_seconds = 45.0
+    @staticmethod
+    def _expansion_budget_for_advertised(advertised: int | None) -> tuple[float, int]:
+        """
+        Longer scroll/load-more budget when StubHub reports many listings (virtualized lists).
+        Returns (max_duration_seconds, max_inner_rounds).
+        """
+        if advertised is None or advertised < 1:
+            return (45.0, 36)
+        adv = min(int(advertised), 2000)
+        duration = min(180.0, max(45.0, 45.0 + adv * 0.35))
+        rounds = min(90, max(36, 24 + adv // 6))
+        return (duration, rounds)
+
+    async def _load_all_listing_inventory(
+        self,
+        *,
+        max_duration_seconds: float | None = None,
+        max_rounds: int | None = None,
+    ) -> dict:
+        max_duration_seconds = 45.0 if max_duration_seconds is None else float(max_duration_seconds)
+        max_rounds = 36 if max_rounds is None else int(max_rounds)
+        max_rounds = max(12, min(max_rounds, 120))
+
         started_at = time.perf_counter()
-        stable_rounds = 0
+        no_growth_rounds = 0
         last_visible_count = -1
+        last_id_count = -1
         target_listing_count: int | None = None
+        load_more_clicks = 0
+        stop_reason = "max_iterations"
 
-        for _ in range(24):
+        stall_retry_budget = 2
+        for _ in range(max_rounds):
             if time.perf_counter() - started_at >= max_duration_seconds:
                 logger.info(
                     f"[Scraper] Inventory expansion budget exhausted after {max_duration_seconds:.1f}s; proceeding with extraction."
                 )
+                stop_reason = "timeout"
                 break
+            load_more_available = False
+            load_more_clicked = False
             try:
                 show_more = self.page.get_by_role("button", name=re.compile("Show more|See more|Load more", re.IGNORECASE))
                 if await show_more.count() > 0 and await show_more.first.is_visible():
-                    await show_more.first.click()
-                    await asyncio.sleep(1.5)
+                    load_more_available = True
+                    disabled = await show_more.first.get_attribute("disabled")
+                    aria_disabled = await show_more.first.get_attribute("aria-disabled")
+                    if disabled is None and str(aria_disabled or "").lower() != "true":
+                        await show_more.first.click()
+                        await asyncio.sleep(1.5)
+                        load_more_clicks += 1
+                        load_more_clicked = True
             except Exception:
                 pass
 
@@ -348,22 +649,56 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 await self.page.evaluate(
                     """() => {
                         window.scrollTo(0, document.body.scrollHeight);
-                        const candidates = Array.from(document.querySelectorAll('div, section, ul, main'))
+                        const containers = Array.from(document.querySelectorAll('div, section, ul, main'))
                             .filter((el) => {
                                 const style = window.getComputedStyle(el);
-                                const scrollable = el.scrollHeight > (el.clientHeight + 40);
                                 const overflowY = style.overflowY || '';
-                                return scrollable && ['auto', 'scroll'].includes(overflowY);
+                                return el.scrollHeight > (el.clientHeight + 40) && ['auto', 'scroll'].includes(overflowY);
                             })
-                            .sort((a, b) => b.scrollHeight - a.scrollHeight)
-                            .slice(0, 8);
-                        for (const el of candidates) {
+                            .sort((a, b) => {
+                                const aCards = a.querySelectorAll('[data-listing-id], [data-listingid], [role="listitem"], [data-testid*="listing"]').length;
+                                const bCards = b.querySelectorAll('[data-listing-id], [data-listingid], [role="listitem"], [data-testid*="listing"]').length;
+                                if (bCards !== aCards) return bCards - aCards;
+                                return b.scrollHeight - a.scrollHeight;
+                            });
+                        const dominant = containers[0];
+                        if (dominant) {
+                            const step = Math.max(80, Math.floor(dominant.clientHeight * 0.85));
+                            dominant.scrollTop = Math.min(dominant.scrollHeight, dominant.scrollTop + step);
+                            dominant.scrollTop = Math.min(dominant.scrollHeight, dominant.scrollTop + step);
+                        }
+                        for (const el of containers.slice(1, 5)) {
                             try { el.scrollTop = el.scrollHeight; } catch (e) {}
                         }
                     }"""
                 )
             except Exception:
                 pass
+
+            at_bottom = False
+            try:
+                at_bottom = bool(
+                    await self.page.evaluate(
+                        """() => {
+                            const containers = Array.from(document.querySelectorAll('div, section, ul, main'))
+                                .filter((el) => {
+                                    const style = window.getComputedStyle(el);
+                                    const overflowY = style.overflowY || '';
+                                    return el.scrollHeight > (el.clientHeight + 40) && ['auto', 'scroll'].includes(overflowY);
+                                })
+                                .sort((a, b) => b.scrollHeight - a.scrollHeight)
+                                .slice(0, 1);
+                            const el = containers[0];
+                            if (!el) {
+                                const top = window.scrollY || window.pageYOffset || 0;
+                                return (window.innerHeight + top) >= ((document.body && document.body.scrollHeight) || 0) - 40;
+                            }
+                            return (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 24);
+                        }"""
+                    )
+                )
+            except Exception:
+                at_bottom = False
 
             try:
                 await self.page.wait_for_load_state("networkidle", timeout=3000)
@@ -377,17 +712,60 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 pass
 
             visible_count = await self._count_visible_listing_nodes()
-            if visible_count <= last_visible_count:
-                stable_rounds += 1
-            else:
-                stable_rounds = 0
-            last_visible_count = max(last_visible_count, visible_count)
+            listing_ids_seen = 0
+            try:
+                listing_ids_seen = int(
+                    await self.page.evaluate(
+                        """() => {
+                            const ids = new Set();
+                            for (const el of document.querySelectorAll('[data-listing-id], [data-listingid]')) {
+                                const id = el.getAttribute('data-listing-id') || el.getAttribute('data-listingid');
+                                if (id) ids.add(String(id));
+                            }
+                            return ids.size;
+                        }"""
+                    )
+                )
+            except Exception:
+                listing_ids_seen = 0
 
-            if target_listing_count and last_visible_count < target_listing_count:
+            grew_visible = visible_count > last_visible_count
+            grew_ids = listing_ids_seen > last_id_count
+            if not grew_visible and not grew_ids:
+                no_growth_rounds += 1
+            else:
+                no_growth_rounds = 0
+            last_visible_count = max(last_visible_count, visible_count)
+            last_id_count = max(last_id_count, listing_ids_seen)
+
+            if target_listing_count and last_visible_count < target_listing_count and no_growth_rounds < 8:
                 continue
 
-            if stable_rounds >= 4:
+            if load_more_available and not load_more_clicked and no_growth_rounds >= 3:
+                stop_reason = "load_more_disabled"
                 break
+            if no_growth_rounds >= 6 and at_bottom and not load_more_available:
+                stop_reason = "bottom_no_growth"
+                break
+            if no_growth_rounds >= 8:
+                if stall_retry_budget > 0:
+                    stall_retry_budget -= 1
+                    no_growth_rounds = 0
+                    stop_reason = "stall_retry"
+                    await asyncio.sleep(1.0)
+                    continue
+                stop_reason = "no_growth"
+                break
+
+        return {
+            "load_more_clicks": load_more_clicks,
+            "no_growth_rounds": no_growth_rounds,
+            "unique_ids_seen": max(last_id_count, 0),
+            "stop_reason": stop_reason,
+            "stall_retries_used": 2 - stall_retry_budget,
+            "expansion_max_duration_seconds": max_duration_seconds,
+            "expansion_max_rounds": max_rounds,
+        }
 
     @staticmethod
     def _collect_listing_objects(root) -> list[dict]:
@@ -442,7 +820,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         return False
 
     async def _extract_passes_from_dom(self) -> list[dict]:
-        async def _extract_from_context(ctx) -> list[dict]:
+        async def _extract_from_context(ctx, source_tag: str) -> list[dict]:
             selectors = [
                 'div[role="button"].sc-194s59m-4',
                 '[data-testid*="listing"]',
@@ -525,28 +903,34 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 listing_id = data.get("listingId")
                 title = data.get("title")
                 text = data.get("text") or ""
+                lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+                price, currency = self._primary_price_value_from_card_text(text)
                 price_text = self._normalize_price_text_display(data.get("priceText") or "") or ""
-
-                price_match = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)", price_text)
-                if not price_match and text:
-                    price_match = re.search(r"[$€£R]\s?([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
-                if not price_match:
-                    continue
-
-                price = price_match.group(1).replace(",", "")
-                currency = self._currency_from_text(price_text or text)
-                if "." not in price:
-                    price = f"{price}.00"
+                if not price:
+                    price_match = re.search(r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)", price_text)
+                    if not price_match and text:
+                        price_match = re.search(r"[$€£R]\s?([0-9][0-9,]*(?:\.[0-9]{1,2})?)", text)
+                    if not price_match:
+                        continue
+                    price = price_match.group(1).replace(",", "")
+                    if "." not in price:
+                        price = f"{price}.00"
+                    currency = self._currency_from_text(price_text or text)
+                else:
+                    currency = currency or self._currency_from_text(text)
 
                 availability = self._availability_from_text(data.get("rawAvail") or text)
-                lot_name = title
-                if not lot_name:
-                    first_lines = [l.strip() for l in text.splitlines() if l.strip()]
-                    lot_name = first_lines[0][:120] if first_lines else None
+                lot_name = self._dom_pick_lot_name(title, lines)
                 if not lot_name:
                     continue
 
-                dedup_key = f"{listing_id}" if listing_id else f"{lot_name}|{price}|{availability}"
+                display_price = f"${price}" if price else (price_text or "")
+                dedup_key = (
+                    f"{listing_id}"
+                    if listing_id
+                    else f"{lot_name}|{self._price_identity_token(price)}|{availability}"
+                )
                 if dedup_key in seen:
                     continue
                 seen.add(dedup_key)
@@ -559,9 +943,10 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "currency": currency or None,
                         "availability": availability,
                         "listing_id": listing_id,
+                        "_source": source_tag,
                         "listing_details": {
                             "title": lot_name,
-                            "price_incl_fees": price_text or f"${price}",
+                            "price_incl_fees": display_price or price_text,
                             "availability": availability,
                             "rating": data.get("rating"),
                             "notes": data.get("notes"),
@@ -585,7 +970,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             logger.warning(f"[Scraper] Failed to save debug screenshot: {e}")
 
         await self.human_delay()
-        dom_passes = await _extract_from_context(self.page)
+        dom_passes = await _extract_from_context(self.page, "dom")
         logger.info(f"[Scraper] DOM extraction found {len(dom_passes or [])} passes")
 
         frame_passes: list[dict] = []
@@ -593,7 +978,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             if frame == self.page.main_frame:
                 continue
             try:
-                frame_passes.extend(await _extract_from_context(frame))
+                frame_passes.extend(await _extract_from_context(frame, "frame"))
             except Exception:
                 continue
 
@@ -647,19 +1032,30 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             for data in panel_cards:
                 text = data.get("text") or ""
                 heading = data.get("heading")
-                # Detect symbol like '$', '€', '£', or 'R'
-                price_match = re.search(r"([$€£R])\\s?([0-9][0-9,]*(?:\\.[0-9]{2})?)", text)
-                if not price_match:
-                    continue
-                
-                symbol = price_match.group(1)
-                price = price_match.group(2).replace(",", "")
+                lines = [l.strip() for l in text.splitlines() if l.strip()]
+                price, currency_code = self._primary_price_value_from_card_text(text)
+                if not price:
+                    price_match = re.search(
+                        r"([$€£R])\s?([0-9][0-9,]*(?:\.[0-9]{2})?)", text
+                    )
+                    if not price_match:
+                        continue
+                    price = price_match.group(2).replace(",", "")
+                    if "." not in price:
+                        price = f"{price}.00"
+                    currency_code = self._currency_from_text(price_match.group(1)) or self._currency_from_text(
+                        text
+                    )
                 availability = self._availability_from_text(text)
-                lot_name = heading or text.splitlines()[0].strip()[:120]
+                lot_name = self._dom_pick_lot_name(heading, lines)
+                if not lot_name:
+                    continue
                 listing_id = data.get("listingId")
-                currency_code = self._currency_from_text(symbol) or self._currency_from_text(text)
-                
-                dedup_key = f"{listing_id}" if listing_id else f"{lot_name}|{price}|{currency_code}|{availability}"
+                dedup_key = (
+                    f"{listing_id}"
+                    if listing_id
+                    else f"{lot_name}|{self._price_identity_token(price)}|{currency_code}|{availability}"
+                )
                 if dedup_key in seen:
                     continue
                 seen.add(dedup_key)
@@ -668,9 +1064,15 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         "lot_name": lot_name,
                         "normalized_lot_name": normalize_lot_name(lot_name),
                         "price": price,
-                        "currency": currency_code or None,
+                        "currency": (currency_code or None) or self._currency_from_text(text) or None,
                         "availability": availability,
                         "listing_id": listing_id,
+                        "_source": "dom_panel",
+                        "listing_details": {
+                            "title": lot_name,
+                            "price_incl_fees": f"${price}",
+                            "availability": availability,
+                        },
                         "details": text if len(text) < 500 else text[:500] + "...",
                     }
                 )
@@ -701,23 +1103,35 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 }"""
             )
         except Exception:
-            return []
+            raw_cards = []
 
         fuzzy_passes = []
         seen = set()
         for data in raw_cards or []:
             text = data.get("text") or ""
             heading = data.get("heading")
-            price_match = re.search(r"([$€£])\s?([0-9][0-9,]*(?:\.[0-9]{2})?)", text)
-            if not price_match:
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            if len(lines) < 2:
                 continue
-            symbol = price_match.group(1)
-            price = price_match.group(2).replace(",", "")
+            price, currency_code = self._primary_price_value_from_card_text(text)
+            if not price:
+                price_match = re.search(r"([$€£])\s?([0-9][0-9,]*(?:\.[0-9]{2})?)", text)
+                if not price_match:
+                    continue
+                price = price_match.group(2).replace(",", "")
+                if "." not in price:
+                    price = f"{price}.00"
+                currency_code = self._currency_from_text(price_match.group(1)) or self._currency_from_text(text)
             availability = self._availability_from_text(text)
-            lot_name = heading or text.splitlines()[0].strip()[:120]
+            lot_name = self._dom_pick_lot_name(heading, lines)
+            if not lot_name:
+                continue
             listing_id = data.get("listingId")
-            currency_code = self._currency_from_text(symbol) or self._currency_from_text(text)
-            dedup_key = f"{listing_id}" if listing_id else f"{lot_name}|{price}|{currency_code}|{availability}"
+            dedup_key = (
+                f"{listing_id}"
+                if listing_id
+                else f"{lot_name}|{self._price_identity_token(price)}|{currency_code}|{availability}"
+            )
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
@@ -726,9 +1140,15 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "lot_name": lot_name,
                     "normalized_lot_name": normalize_lot_name(lot_name),
                     "price": price,
-                    "currency": currency_code or None,
+                    "currency": (currency_code or None) or self._currency_from_text(text) or None,
                     "availability": availability,
                     "listing_id": listing_id,
+                    "_source": "dom_fuzzy",
+                    "listing_details": {
+                        "title": lot_name,
+                        "price_incl_fees": f"${price}",
+                        "availability": availability,
+                    },
                     "details": text if len(text) < 500 else text[:500] + "...",
                 }
             )
@@ -738,9 +1158,17 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         payload = await self.page.evaluate(
             """() => {
                 const roots = [];
-                for (const key of ["__PRELOADED_STATE__", "__INITIAL_STATE__", "__NEXT_DATA__", "SHAppApi"]) {
+                for (const key of ["__PRELOADED_STATE__", "__INITIAL_STATE__", "__NEXT_DATA__", "SHAppApi", "__APOLLO_STATE__", "__NUXT__"]) {
                     const v = window[key];
                     if (v) roots.push(v);
+                }
+                // Also inspect JSON script tags that often contain listing state.
+                for (const script of Array.from(document.querySelectorAll('script[type="application/json"], script#__NEXT_DATA__'))) {
+                    try {
+                        const txt = (script.textContent || '').trim();
+                        if (!txt) continue;
+                        roots.push(JSON.parse(txt));
+                    } catch (e) {}
                 }
                 return roots;
             }"""
@@ -766,13 +1194,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             price = self._numeric_price(str(price_val)) if price_val is not None else None
             if not listing_id or not price:
                 continue
-            lot_name = (
-                row.get("listingTitle")
-                or row.get("sectionName")
-                or row.get("ticketClassName")
-                or row.get("zoneName")
-                or row.get("name")
-            )
+            lot_name = StubHubParkingScraper._pick_display_lot_name_from_inventory(row)
             if not lot_name:
                 continue
             availability = self._availability_from_quantity_list(row.get("availableQuantities"))
@@ -810,10 +1232,24 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         return passes
 
     def _extract_passes_from_json_payload(self, raw_text: str) -> list[dict]:
+        data = None
         try:
             data = json.loads(raw_text)
         except Exception:
-            return []
+            text = (raw_text or "").strip()
+            idx_obj = text.find("{")
+            idx_arr = text.find("[")
+            starts = [i for i in [idx_obj, idx_arr] if i >= 0]
+            if not starts:
+                return []
+            start = min(starts)
+            trimmed = text[start:]
+            # Drop common anti-CSRF prefix like )]}'
+            trimmed = re.sub(r"^\)\]\}',?\s*", "", trimmed)
+            try:
+                data = json.loads(trimmed)
+            except Exception:
+                return []
         found = self._collect_listing_objects(data)
         if not found:
             return []
@@ -831,13 +1267,7 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             price = self._numeric_price(str(price_val)) if price_val is not None else None
             if not listing_id or not price:
                 continue
-            lot_name = (
-                row.get("listingTitle")
-                or row.get("sectionName")
-                or row.get("ticketClassName")
-                or row.get("zoneName")
-                or row.get("name")
-            )
+            lot_name = StubHubParkingScraper._pick_display_lot_name_from_inventory(row)
             if not lot_name:
                 continue
             availability = self._availability_from_quantity_list(row.get("availableQuantities"))
@@ -932,26 +1362,9 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
             price = StubHubParkingScraper._numeric_price(price_text)
             if not price:
                 continue
-            currency = StubHubParkingScraper._currency_from_text(price_text)
-            dedup_key = f"section:{section}|price:{price}"
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            lot = f"Section {section}"
-            passes.append(
-                {
-                    "lot_name": lot,
-                    "normalized_lot_name": normalize_lot_name(lot),
-                    "price": price,
-                    "currency": currency or None,
-                    "availability": None,
-                    "_source": source,
-                    "listing_details": {
-                        "title": lot,
-                        "price_incl_fees": price_text,
-                    },
-                }
-            )
+            # Section-only telemetry rows (without listing identity) inflate counts.
+            # Do not emit them as listing rows.
+            continue
 
         # Loose fallback: token-based extraction around listingId for escaped/partial payloads.
         listing_pat = re.compile(r'"listingId"\s*:\s*(?P<listing>\d+)')
@@ -1049,6 +1462,34 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
 
             try:
                 advertised_total = None
+                expansion_meta = {
+                    "load_more_clicks": 0,
+                    "no_growth_rounds": 0,
+                    "unique_ids_seen": 0,
+                    "stop_reason": "not_started",
+                    "stall_retries_used": 0,
+                }
+                budget_dur, budget_rounds = StubHubParkingScraper._expansion_budget_for_advertised(None)
+
+                def _merge_expansion_meta(acc: dict, nxt: dict) -> None:
+                    acc["load_more_clicks"] = int(acc.get("load_more_clicks", 0)) + int(
+                        nxt.get("load_more_clicks", 0)
+                    )
+                    acc["no_growth_rounds"] = max(
+                        int(acc.get("no_growth_rounds", 0)),
+                        int(nxt.get("no_growth_rounds", 0)),
+                    )
+                    acc["unique_ids_seen"] = max(
+                        int(acc.get("unique_ids_seen", 0)),
+                        int(nxt.get("unique_ids_seen", 0)),
+                    )
+                    acc["stop_reason"] = str(
+                        nxt.get("stop_reason") or acc.get("stop_reason") or ""
+                    )
+                    acc["stall_retries_used"] = max(
+                        int(acc.get("stall_retries_used", 0)),
+                        int(nxt.get("stall_retries_used", 0)),
+                    )
 
                 def _handle_response(resp):
                     task = asyncio.create_task(_capture_response(resp))
@@ -1074,19 +1515,31 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     visible_before_expand = await self._count_visible_listing_nodes()
                     total_listing_count = self._extract_total_listing_count(body_text)
                     advertised_total = total_listing_count or advertised_total
+                    budget_dur, budget_rounds = StubHubParkingScraper._expansion_budget_for_advertised(
+                        advertised_total
+                    )
                     should_expand = (
                         total_listing_count is None
                         or visible_before_expand < total_listing_count
                         or visible_before_expand < 40
                     )
                     if should_expand:
-                        await self._load_all_listing_inventory()
+                        expansion_meta = await self._load_all_listing_inventory(
+                            max_duration_seconds=budget_dur,
+                            max_rounds=budget_rounds,
+                        )
                     else:
                         logger.info(
                             f"[Scraper] Listing pane already appears expanded ({visible_before_expand}/{total_listing_count or visible_before_expand} visible)."
                         )
+                        expansion_meta["stop_reason"] = "already_expanded"
+                    expansion_meta["expansion_primary_duration_seconds"] = budget_dur
+                    expansion_meta["expansion_primary_rounds"] = budget_rounds
                 except Exception as exc:
                     logger.warning(f"[Scraper] Inventory expansion failed; continuing with partial page state: {exc}")
+                    expansion_meta["stop_reason"] = "expansion_exception"
+                    expansion_meta["expansion_primary_duration_seconds"] = budget_dur
+                    expansion_meta["expansion_primary_rounds"] = budget_rounds
 
                 dom_passes = await self._extract_passes_from_dom()
                 state_passes = await self._extract_passes_from_state()
@@ -1105,13 +1558,28 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                 passes = self._merge_pass_collections(dom_passes, state_passes, embedded_passes, xhr_passes)
                 passes = self._filter_telemetry_rows(passes)
 
-                if advertised_total and len(passes) + 5 < advertised_total:
+                shortfall_passes = 0
+                max_shortfall_rounds = 3
+                while (
+                    advertised_total
+                    and len(passes) + 5 < advertised_total
+                    and shortfall_passes < max_shortfall_rounds
+                ):
+                    prev_len = len(passes)
+                    shortfall_passes += 1
                     logger.info(
-                        f"[Scraper] Extracted {len(passes)} listings but page advertises {advertised_total}; retrying expansion."
+                        f"[Scraper] Extracted {len(passes)} listings but page advertises {advertised_total}; "
+                        f"shortfall expansion pass {shortfall_passes}/{max_shortfall_rounds}."
                     )
                     try:
                         await asyncio.sleep(1.5)
-                        await self._load_all_listing_inventory()
+                        follow_dur = min(120.0, budget_dur * 0.55 + 20.0)
+                        follow_rounds = min(budget_rounds, max(40, budget_rounds // 2 + 14))
+                        retry_meta = await self._load_all_listing_inventory(
+                            max_duration_seconds=follow_dur,
+                            max_rounds=follow_rounds,
+                        )
+                        _merge_expansion_meta(expansion_meta, retry_meta)
                         dom_retry = await self._extract_passes_from_dom()
                         state_retry = await self._extract_passes_from_state()
                         embedded_retry = await self._extract_passes_from_embedded_json()
@@ -1119,7 +1587,9 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                         for payload in captured_payloads + captured_request_payloads:
                             extracted = self._extract_passes_from_json_payload(payload)
                             if not extracted:
-                                extracted = self._extract_passes_from_text(payload, source=f"embedded_xhr_retry_{label}")
+                                extracted = self._extract_passes_from_text(
+                                    payload, source=f"embedded_xhr_retry_{label}_{shortfall_passes}"
+                                )
                             xhr_retry.extend(extracted)
                         passes = self._merge_pass_collections(
                             passes,
@@ -1129,8 +1599,15 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                             xhr_retry,
                         )
                         passes = self._filter_telemetry_rows(passes)
+                        if len(passes) < prev_len + 3:
+                            logger.info(
+                                "[Scraper] Shortfall pass produced minimal growth; stopping shortfall retries."
+                            )
+                            break
                     except Exception as retry_exc:
-                        logger.warning(f"[Scraper] Retry expansion/extraction failed: {retry_exc}")
+                        logger.warning(f"[Scraper] Shortfall expansion/extraction failed: {retry_exc}")
+                        break
+                expansion_meta["shortfall_extra_passes_used"] = shortfall_passes
 
                 probe = {
                     "attempt": label,
@@ -1146,6 +1623,25 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
                     "xhr_passes": len(xhr_passes),
                     "merged_passes": len(passes),
                     "advertised_total": advertised_total,
+                    "load_more_clicks": expansion_meta.get("load_more_clicks", 0),
+                    "no_growth_rounds": expansion_meta.get("no_growth_rounds", 0),
+                    "unique_ids_seen": expansion_meta.get("unique_ids_seen", 0),
+                    "stop_reason": expansion_meta.get("stop_reason", ""),
+                    "stall_retries_used": expansion_meta.get("stall_retries_used", 0),
+                    "expansion_primary_duration_seconds": expansion_meta.get(
+                        "expansion_primary_duration_seconds", budget_dur
+                    ),
+                    "expansion_primary_rounds": expansion_meta.get(
+                        "expansion_primary_rounds", budget_rounds
+                    ),
+                    "shortfall_extra_passes_used": expansion_meta.get(
+                        "shortfall_extra_passes_used", 0
+                    ),
+                    "unique_ids_vs_advertised_gap": (
+                        int(advertised_total) - int(expansion_meta.get("unique_ids_seen", 0))
+                        if advertised_total is not None
+                        else None
+                    ),
                 }
                 return passes, probe
             finally:
@@ -1210,28 +1706,3 @@ class StubHubParkingScraper(TicketingPlaywrightBase):
         await parking_repo.clear_for_event(event)
         await parking_repo.add_passes(event, passes)
         return len(passes)
-    @staticmethod
-    def _collect_listing_objects(root) -> list[dict]:
-        results: list[dict] = []
-        seen_obj: set[int] = set()
-        stack = [root]
-        while stack:
-            cur = stack.pop()
-            if not isinstance(cur, (dict, list)):
-                continue
-            if isinstance(cur, list):
-                for item in cur:
-                    stack.append(item)
-                continue
-            obj_id = id(cur)
-            if obj_id in seen_obj:
-                continue
-            seen_obj.add(obj_id)
-            listing_id = cur.get("listingId") or cur.get("listing_id") or cur.get("id")
-            price = cur.get("price") or cur.get("rawPrice") or cur.get("formattedPrice")
-            if listing_id and price:
-                results.append(cur)
-            for v in cur.values():
-                if isinstance(v, (dict, list)):
-                    stack.append(v)
-        return results

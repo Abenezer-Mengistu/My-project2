@@ -45,6 +45,12 @@ from database.repositories.ticketing.price_snapshots import get_price_snapshot_r
 from database.repositories.ticketing.venues import get_venue_repository
 from utils.logger import logger
 from utils.normalization import normalize_lot_name, normalize_section_name
+from utils.stubhub_parking_snapshot import (
+    DEFAULT_SNAPSHOT_MAX_AGE_S,
+    diff_card_listings,
+    load_snapshot,
+    save_snapshot_atomic,
+)
 from utils.pricing import (
     extract_total_price,
     compute_listing_metrics,
@@ -63,6 +69,11 @@ STORAGE_EXPORTS = STORAGE_DIR / "exports"
 STORAGE_MONITORING = STORAGE_DIR / "monitoring"
 STORAGE_SEARCH_RESULTS = STORAGE_DIR / "search_results"
 UI_DIR = BASE_DIR / "ui"
+
+# Client search event-details: outer wait must exceed inner parking scrape. Large parking events (200+ listings)
+# use long adaptive expansion (~180s) plus up to three shortfall passes (~120s each) plus goto/extract—often 10–20+ min.
+CLIENT_SEARCH_PARKING_SCRAPE_TIMEOUT_S = 1200.0  # 20 min single-event scrape
+CLIENT_SEARCH_EVENT_DETAILS_TIMEOUT_S = 1320.0  # 22 min incl. Playwright cluster / retries
 
 
 def _storage_output_path(excel_path: str) -> Path:
@@ -330,6 +341,8 @@ _stubhub_rates_cache: dict[str, object] = {
     "rates": None,
 }
 _spothero_live_cache: dict[str, dict[str, object]] = {}
+# Parking URLs currently running a background snapshot refresh (stale-while-revalidate).
+_stubhub_snapshot_refresh_inflight: set[str] = set()
 SPOTHERO_PUBLIC_HEADERS = {
     "User-Agent": CONFIG["app"]["default_user_agent"],
     "Accept-Language": "en-US,en;q=0.9",
@@ -1151,36 +1164,123 @@ def _is_unusable_stubhub_lot_name(value: str | None) -> bool:
     return False
 
 
+def _stubhub_lot_name_rank_score(value: str | None) -> int:
+    text = _clean_stubhub_text(value)
+    if not text:
+        return -100
+    lower = text.lower()
+    score = 0
+    if _is_generic_stubhub_lot_name(text):
+        score -= 20
+    if _is_unusable_stubhub_lot_name(text):
+        score -= 8
+    if re.search(r"\b(garage|lot|parking)\b", lower):
+        score += 8
+    if re.search(r"\b(st|street|ave|avenue|blvd|boulevard|dr|drive|rd|road|pl|place)\b", lower):
+        score += 10
+    if re.search(r"\b\d{1,5}\s+[a-z]", lower):
+        score += 8
+    if re.search(r"\b(within\s+[0-9.]+\s*(mi|km)|[0-9.]+\s*(mi|km)\s+from venue)\b", lower):
+        score -= 8
+    if re.search(r"\b\d+\s*-\s*\d+\s*passes?\b", lower):
+        score -= 6
+    return score
+
+
+def _has_parseable_stubhub_price(value: str | int | float | None) -> bool:
+    text = _clean_stubhub_text(str(value or ""))
+    if not text:
+        return False
+    return bool(re.search(r"\d", text))
+
+
+def _is_real_stubhub_listing_row(row: dict, details: dict, lot_name: str) -> bool:
+    listing_id = row.get("listing_id") or details.get("listingId") or details.get("inventoryId") or details.get("listingKey")
+    price_display = _price_display_for_row(row)
+    has_price = _has_parseable_stubhub_price(price_display) or _has_parseable_stubhub_price(row.get("price"))
+    if not has_price:
+        return False
+    if listing_id:
+        return True
+    # Keep parseable raw rows even when lot names are generic placeholders.
+    lot_signal = _clean_stubhub_text(lot_name)
+    detail_signal = _clean_stubhub_text(
+        row.get("availability") or details.get("availability") or details.get("notes") or details.get("rating")
+    )
+    title_signal = _clean_stubhub_text(details.get("title") or details.get("name"))
+    return bool(lot_signal or detail_signal or title_signal)
+
+
 def _choose_stubhub_lot_name(row: dict, details: dict) -> str:
-    candidates = [
-        row.get("lot_name"),
-        details.get("title"),
-        details.get("lot_name"),
-        details.get("name"),
-    ]
+    candidates = [row.get("lot_name"), details.get("title"), details.get("lot_name"), details.get("name")]
+    cleaned: list[str] = []
     for candidate in candidates:
         text = _clean_stubhub_text(candidate)
-        if not text:
-            continue
-        if re.search(r"\bprice per pass\b", text, flags=re.IGNORECASE):
-            continue
-        text = re.sub(r"\s*-\s*[0-9.]+\s+mi(?:les?)?\s+(?:from venue|away)\b", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*-\s*within\s+[0-9.]+\s+mi(?:les?)?\b", "", text, flags=re.IGNORECASE)
-        text = text.strip(" -")
-        if not text:
-            continue
-        if re.fullmatch(r"\$?\d[\d,.]*(?:\.\d{1,2})?\+?", text):
-            continue
-        if re.fullmatch(r"\d+\s*-\s*\d+\s+passes?", text, flags=re.IGNORECASE):
-            continue
-        if re.fullmatch(r"\d+\s+passes?", text, flags=re.IGNORECASE):
-            continue
-        if re.fullmatch(r"(Within\s+[0-9.]+\s+Mile(?:s)?\s+Of\s+Venue|Within\s+[0-9.]+\s+mi)", text, flags=re.IGNORECASE):
-            continue
-        if _is_generic_stubhub_lot_name(text):
-            continue
-        return text
-    return ""
+        if text:
+            cleaned.append(text)
+    if cleaned:
+        return sorted(cleaned, key=_stubhub_lot_name_rank_score, reverse=True)[0]
+    fallback = _clean_stubhub_text(row.get("lot_name") or details.get("title") or details.get("name"))
+    if fallback:
+        return fallback
+    listing_id = row.get("listing_id") or details.get("listingId")
+    if listing_id:
+        return f"Listing {listing_id}"
+    return "Parking listing"
+
+
+def _apply_stubhub_parity_policy(card: dict, parking_url: str) -> dict:
+    out = dict(card or {})
+    listings = out.get("listings") if isinstance(out.get("listings"), list) else []
+    loaded = len(listings)
+    advertised = out.get("advertised_total")
+    adv_int: int | None = None
+    try:
+        if advertised is not None:
+            adv_int = int(advertised)
+    except (TypeError, ValueError):
+        adv_int = None
+    incomplete = bool(out.get("scrape_incomplete"))
+    # If we have as many rows as StubHub advertised, treat as good: expansion often ends with
+    # stop_reason timeout/no_growth while the inventory is already fully extracted — otherwise
+    # the UI stays on "waiting for full load" forever despite a matching count.
+    if adv_int is not None and loaded == adv_int:
+        out["scrape_incomplete"] = False
+        out["parity_pending"] = False
+        out["parity_loaded_count"] = loaded
+        out["parity_target_count"] = adv_int
+        out["parity_reason"] = None
+        out["listing_count"] = loaded
+        if incomplete:
+            logger.info(
+                f"[client-search parity] matched {parking_url} | advertised={adv_int} loaded={loaded} "
+                f"(ignored scrape_incomplete; counts aligned)"
+            )
+        else:
+            logger.info(f"[client-search parity] matched {parking_url} | advertised={adv_int} loaded={loaded}")
+        return out
+
+    parity_pending = bool(incomplete or (adv_int is not None and loaded != adv_int))
+    if parity_pending:
+        out["parity_pending"] = True
+        out["parity_loaded_count"] = loaded
+        out["parity_target_count"] = adv_int
+        out["parity_reason"] = "scrape_incomplete" if incomplete else "count_mismatch"
+        out["listings"] = []
+        out["listing_count"] = 0
+        logger.info(
+            f"[client-search parity] pending {parking_url} | advertised={adv_int!r} loaded={loaded} "
+            f"incomplete={incomplete}"
+        )
+    else:
+        out["parity_pending"] = False
+        out["parity_loaded_count"] = loaded
+        out["parity_target_count"] = adv_int
+        out["parity_reason"] = None
+        out["listing_count"] = loaded
+        if adv_int is not None:
+            logger.info(f"[client-search parity] matched {parking_url} | advertised={adv_int} loaded={loaded}")
+    return out
 
 
 def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> list[dict]:
@@ -1206,6 +1306,9 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
                 "location": item.get("formattedVenueLocation") or item.get("location") or "",
                 "parking_url": canonical,
                 "listing_count": 0,
+                "advertised_total": None,
+                "scrape_incomplete": False,
+                "scrape_stop_reason": None,
                 "sort_ts": (((item.get("eventMetadata") or {}).get("common") or {}).get("eventStartDateTime") or 0),
                 "listings": [],
             },
@@ -1216,11 +1319,6 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
         if not canonical:
             continue
         meta = meta_by_url.get(canonical, {})
-        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
-        lot_name = _choose_stubhub_lot_name(row, details)
-        availability = _clean_stubhub_text(row.get("availability") or details.get("availability"))
-        if _is_unusable_stubhub_lot_name(lot_name):
-            continue
         group = grouped.setdefault(
             canonical,
             {
@@ -1232,10 +1330,32 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
                 "location": meta.get("formattedVenueLocation") or "",
                 "parking_url": canonical,
                 "listing_count": 0,
+                "advertised_total": None,
+                "scrape_incomplete": False,
+                "scrape_stop_reason": None,
                 "sort_ts": (((meta.get("eventMetadata") or {}).get("common") or {}).get("eventStartDateTime") or 0),
                 "listings": [],
             },
         )
+        adv = row.get("advertised_total")
+        if adv is not None:
+            try:
+                adv_int = int(adv)
+                cur = group.get("advertised_total")
+                if cur is None or adv_int > cur:
+                    group["advertised_total"] = adv_int
+            except (TypeError, ValueError):
+                pass
+        if row.get("scrape_incomplete"):
+            group["scrape_incomplete"] = True
+        ssr = row.get("scrape_stop_reason")
+        if ssr and not group.get("scrape_stop_reason"):
+            group["scrape_stop_reason"] = str(ssr)
+        details = row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}
+        lot_name = _choose_stubhub_lot_name(row, details)
+        availability = _clean_stubhub_text(row.get("availability") or details.get("availability"))
+        if not _is_real_stubhub_listing_row(row, details, lot_name):
+            continue
         group["listings"].append(
             {
                 "lot_name": lot_name,
@@ -1245,7 +1365,11 @@ def _group_client_search_results(search_items: list[dict], rows: list[dict]) -> 
                 "rating": _clean_stubhub_text(details.get("rating")),
                 "notes": _clean_listing_notes(details.get("notes"), lot_name),
                 "listing_id": row.get("listing_id"),
-                "raw_details": row.get("listing_details"),
+                "raw_details": {
+                    **((row.get("listing_details") if isinstance(row.get("listing_details"), dict) else {}) or {}),
+                    "raw_lot_name": _clean_stubhub_text(row.get("lot_name")),
+                    "display_lot_name": lot_name,
+                },
             }
         )
 
@@ -1744,6 +1868,93 @@ async def ui_client_search_run(request: Request):
         return JSONResponse({"success": False, "error": str(exc)}, status_code=502)
 
 
+def _build_client_search_event_details_response_body(
+    parking_url: str,
+    search_item: dict,
+    phase2_result: dict,
+) -> dict:
+    grouped_results = _group_client_search_results([search_item], phase2_result.get("data") or [])
+    card = grouped_results[0] if grouped_results else _group_client_search_results([search_item], [])[0]
+    for err in phase2_result.get("errors") or []:
+        if _canonical_stubhub_url(err.get("parking_url")) != parking_url:
+            continue
+        probe_err = err.get("probe") or {}
+        if card.get("advertised_total") is None:
+            at_err = probe_err.get("advertised_total")
+            if at_err is not None:
+                try:
+                    card["advertised_total"] = int(at_err)
+                except (TypeError, ValueError):
+                    card["advertised_total"] = at_err
+        sr = str(probe_err.get("stop_reason") or "")
+        if sr and not card.get("scrape_stop_reason"):
+            card["scrape_stop_reason"] = sr
+        if sr in ("timeout", "no_growth", "max_iterations"):
+            card["scrape_incomplete"] = True
+        break
+    card = _apply_stubhub_parity_policy(card, parking_url)
+    return {
+        "success": True,
+        "parking_url": parking_url,
+        "card": card,
+        "errors": phase2_result.get("errors") or [],
+    }
+
+
+def _persist_stubhub_event_durable_snapshot(parking_url: str, response_body: dict) -> dict:
+    """Write JSON snapshot; return catalog metadata for API (diff vs previous snapshot)."""
+    persist_body = {
+        "success": response_body.get("success"),
+        "parking_url": response_body.get("parking_url"),
+        "card": response_body.get("card"),
+        "errors": response_body.get("errors") or [],
+    }
+    catalog_diff = None
+    prev = load_snapshot(STORAGE_DIR, parking_url)
+    if prev and isinstance(prev.get("response"), dict):
+        old_card = prev["response"].get("card") or {}
+        new_card = persist_body.get("card") or {}
+        catalog_diff = diff_card_listings(old_card.get("listings"), new_card.get("listings"))
+    save_snapshot_atomic(STORAGE_DIR, parking_url, {"scraped_at": time.time(), "response": persist_body})
+    _spothero_live_cache.pop(f"stubhub:event-details:failed:{parking_url}", None)
+    if catalog_diff and (
+        catalog_diff.get("added_count")
+        or catalog_diff.get("removed_count")
+        or catalog_diff.get("price_or_avail_changed_count")
+    ):
+        logger.info(f"StubHub catalog diff {parking_url}: {catalog_diff}")
+    return {
+        "from_snapshot": False,
+        "snapshot_saved": True,
+        "catalog_diff": catalog_diff,
+    }
+
+
+async def _stubhub_snapshot_background_refresh(parking_url: str, search_item: dict) -> None:
+    try:
+        phase2_result = await asyncio.wait_for(
+            ticketing_phase2(
+                parking_url=parking_url,
+                limit=1,
+                batch_size=1,
+                export_json=False,
+                persist=False,
+                alert_on_failures=False,
+            ),
+            timeout=CLIENT_SEARCH_EVENT_DETAILS_TIMEOUT_S,
+        )
+        if isinstance(phase2_result, JSONResponse):
+            return
+        body = _build_client_search_event_details_response_body(parking_url, search_item, phase2_result)
+        catalog = _persist_stubhub_event_durable_snapshot(parking_url, body)
+        out = {**body, "catalog": catalog}
+        _live_cache_set(f"stubhub:event-details:{parking_url}", out)
+    except Exception as exc:
+        logger.warning(f"StubHub snapshot background refresh failed for {parking_url}: {exc}")
+    finally:
+        _stubhub_snapshot_refresh_inflight.discard(parking_url)
+
+
 @app.post("/ticketing/ui/client-search/event-details")
 async def ui_client_search_event_details(request: Request):
     content_type = (request.headers.get("content-type") or "").lower()
@@ -1773,37 +1984,65 @@ async def ui_client_search_event_details(request: Request):
 
     try:
         cache_key = f"stubhub:event-details:{parking_url}"
+        failed_cache_key = f"stubhub:event-details:failed:{parking_url}"
+
         cached = _live_cache_get(cache_key, 300)
         if isinstance(cached, dict):
             return cached
 
-        failed_cache_key = f"stubhub:event-details:failed:{parking_url}"
+        durable = load_snapshot(STORAGE_DIR, parking_url)
+        now_ts = time.time()
+        if durable and isinstance(durable.get("response"), dict):
+            resp = durable["response"]
+            scraped_at = float(durable.get("scraped_at") or 0)
+            if resp.get("success") is True:
+                age = now_ts - scraped_at
+                _spothero_live_cache.pop(failed_cache_key, None)
+                if age < DEFAULT_SNAPSHOT_MAX_AGE_S:
+                    out = {
+                        **resp,
+                        "catalog": {
+                            "from_snapshot": True,
+                            "snapshot_stale": False,
+                            "snapshot_scraped_at": scraped_at,
+                        },
+                    }
+                    return _live_cache_set(cache_key, out)
+                if parking_url not in _stubhub_snapshot_refresh_inflight:
+                    _stubhub_snapshot_refresh_inflight.add(parking_url)
+                    asyncio.create_task(_stubhub_snapshot_background_refresh(parking_url, dict(search_item)))
+                out = {
+                    **resp,
+                    "catalog": {
+                        "from_snapshot": True,
+                        "snapshot_stale": True,
+                        "snapshot_scraped_at": scraped_at,
+                        "refresh_enqueued": True,
+                    },
+                }
+                return _live_cache_set(cache_key, out)
+
         failed_cached = _live_cache_get(failed_cache_key, 120)
-        if isinstance(failed_cached, dict):
+        if isinstance(failed_cached, dict) and not durable:
             return JSONResponse(failed_cached, status_code=502)
 
         phase2_result = await asyncio.wait_for(
             ticketing_phase2(
-                parking_urls=parking_url,
+                parking_url=parking_url,
                 limit=1,
                 batch_size=1,
                 export_json=False,
                 persist=False,
                 alert_on_failures=False,
             ),
-            timeout=150.0,
+            timeout=CLIENT_SEARCH_EVENT_DETAILS_TIMEOUT_S,
         )
         if isinstance(phase2_result, JSONResponse):
             return phase2_result
 
-        grouped_results = _group_client_search_results([search_item], phase2_result.get("data") or [])
-        card = grouped_results[0] if grouped_results else _group_client_search_results([search_item], [])[0]
-        payload = {
-            "success": True,
-            "parking_url": parking_url,
-            "card": card,
-            "errors": phase2_result.get("errors") or [],
-        }
+        payload = _build_client_search_event_details_response_body(parking_url, search_item, phase2_result)
+        catalog = _persist_stubhub_event_durable_snapshot(parking_url, payload)
+        payload["catalog"] = catalog
         return _live_cache_set(cache_key, payload)
     except asyncio.TimeoutError:
         error_payload = {
@@ -3077,6 +3316,11 @@ def _normalize_availability(v):
     s = str(v).strip()
     if not s or s.lower() in {"null", "none", "n/a"}:
         return None
+    # Avoid misleading "0 passes" when quantity is unknown or placeholder.
+    if re.fullmatch(r"0\s*pass(es)?", s, flags=re.IGNORECASE):
+        return None
+    if s in {"0", "0 passes", "0 pass"}:
+        return None
     return s
 
 
@@ -3441,12 +3685,12 @@ async def _run_parking_for_event(event_row: dict) -> list[dict]:
         try:
             passes = await asyncio.wait_for(
                 instance.scrape_parking_details(event_obj),
-                timeout=240,
+                timeout=CLIENT_SEARCH_PARKING_SCRAPE_TIMEOUT_S,
             )
         except asyncio.TimeoutError as exc:
             probe = getattr(instance, "_last_probe", {}) or {}
             raise TimeoutError(
-                f"parking scrape exceeded 120s for {event_row.get('event_url')} "
+                f"parking scrape exceeded {int(CLIENT_SEARCH_PARKING_SCRAPE_TIMEOUT_S)}s for {event_row.get('event_url')} "
                 f"(parking_url={event_row.get('parking_url')}, last_probe={probe})"
             ) from exc
         return {
@@ -3495,6 +3739,329 @@ def _parse_parking_urls(parking_urls: str) -> list[str]:
             seen.add(key)
             result.append(norm)
     return result
+
+
+def _compute_scrape_incomplete(loaded_ct: int, probe: dict) -> bool:
+    adv_probe = probe.get("advertised_total")
+    stop_reason = str(probe.get("stop_reason") or "")
+    scrape_incomplete = False
+    if adv_probe is not None:
+        try:
+            ai = int(adv_probe)
+            if loaded_ct + 5 < ai:
+                scrape_incomplete = True
+        except (TypeError, ValueError):
+            pass
+    if stop_reason in ("timeout", "no_growth", "max_iterations") and adv_probe is not None:
+        try:
+            if loaded_ct < int(adv_probe):
+                scrape_incomplete = True
+        except (TypeError, ValueError):
+            pass
+    return scrape_incomplete
+
+
+def _event_results_from_parking_scrape(
+    row: dict,
+    passes: list,
+    probe: dict,
+    scrape_incomplete: bool,
+    event_record,
+) -> list[dict]:
+    event_results: list[dict] = []
+    for p in passes:
+        source = p.get("_source", "dom")
+        det = p.get("listing_details") if isinstance(p.get("listing_details"), dict) else {}
+        availability = _normalize_availability(p.get("availability")) or _normalize_availability(
+            det.get("availability")
+        )
+        listing_type, is_parking_inventory = _classify_parking_row(p.get("lot_name"), source)
+        metrics = compute_listing_metrics(p)
+        event_results.append(
+            {
+                "venue": row.get("venue"),
+                "event_name": row.get("event_name"),
+                "event_date": row.get("event_date"),
+                "parking_url": row.get("parking_url"),
+                "lot_name": p.get("lot_name"),
+                "price": metrics.get("extracted_price"),
+                "currency": metrics.get("currency_resolved"),
+                "availability": availability,
+                "listing_id": p.get("listing_id"),
+                "source": source,
+                "listing_type": listing_type,
+                "is_parking_inventory": is_parking_inventory,
+                "event_id": getattr(event_record, "_id", None),
+                "probe_title": probe.get("title"),
+                "advertised_total": probe.get("advertised_total"),
+                "scrape_incomplete": scrape_incomplete,
+                "scrape_stop_reason": str(probe.get("stop_reason") or "") or None,
+                "listing_details": p.get("listing_details"),
+            }
+        )
+    return event_results
+
+
+async def run_phase2_parking_batch(
+    event_rows: list[dict],
+    *,
+    batch_size: int = 5,
+    persist: bool = False,
+    export_json: bool = True,
+    alert_on_failures: bool = True,
+) -> dict:
+    """Core Phase2 parking scrape (used by HTTP route and CLI). ``event_rows`` already limited."""
+    results: list[dict] = []
+    errors: list[dict] = []
+    batch_summaries: list[dict] = []
+    parking_repo = get_parking_pass_repository()
+    venue_repo = get_venue_repository()
+    event_repo = get_event_repository()
+    run_started_at = datetime.now(timezone.utc)
+    t0 = time.perf_counter()
+    total_events = len(event_rows)
+    total_batches = max(1, (total_events + batch_size - 1) // batch_size) if total_events else 0
+
+    for b_idx in range(total_batches):
+        start = b_idx * batch_size
+        end = min(start + batch_size, total_events)
+        batch = event_rows[start:end]
+        b0 = time.perf_counter()
+        before_rows = len(results)
+        before_errors = len(errors)
+        logger.info(f"[Phase2] Batch {b_idx + 1}/{total_batches} starting ({start + 1}-{end} of {total_events})")
+
+        for row in batch:
+            event_started = time.perf_counter()
+            try:
+                run_result = await _run_parking_for_event(row)
+                passes = run_result.get("passes", [])
+                probe = run_result.get("probe", {})
+                loaded_ct = len(passes)
+                scrape_incomplete = _compute_scrape_incomplete(loaded_ct, probe)
+                event_record = None
+                if persist:
+                    venue_model = await venue_repo.upsert_venue(
+                        {
+                            "name": row.get("venue") or "Unknown Venue",
+                            "stubhub_url": row.get("event_url") or "",
+                            "handler": "stubhub-discovery",
+                            "location": None,
+                        }
+                    )
+                    event_data = {
+                        "venue": venue_model,
+                        "name": row.get("event_name") or "Unknown Event",
+                        "date": _parse_iso_date(row.get("event_date")),
+                        "event_url": row.get("event_url"),
+                        "parking_url": row.get("parking_url"),
+                    }
+                    id_match = re.search(r"/event/(\d+)", row.get("event_url", ""))
+                    if id_match:
+                        event_data["external_id"] = id_match.group(1)
+                    event_record = await event_repo.upsert_event(event_data)
+                    await parking_repo.clear_for_event(event_record)
+                    if passes:
+                        await parking_repo.add_passes(event_record, passes)
+
+                event_results = _event_results_from_parking_scrape(
+                    row, passes, probe, scrape_incomplete, event_record
+                )
+                results.extend(_dedupe_phase2_rows(event_results))
+                if not passes:
+                    errors.append(
+                        {
+                            "event_url": row.get("event_url"),
+                            "parking_url": row.get("parking_url"),
+                            "error": "No parking listings extracted",
+                            "probe": probe,
+                        }
+                    )
+            except Exception as exc:
+                logger.error(f"Phase2 parking scrape failed for {row.get('event_url')}: {exc}")
+                errors.append(
+                    {
+                        "event_url": row.get("event_url"),
+                        "parking_url": row.get("parking_url"),
+                        "error": str(exc),
+                    }
+                )
+            finally:
+                event_elapsed = time.perf_counter() - event_started
+                logger.info(f"[Phase2] Event processed in {event_elapsed:.2f}s :: {row.get('event_url')}")
+
+        batch_elapsed = time.perf_counter() - b0
+        batch_rows = len(results) - before_rows
+        batch_errors = len(errors) - before_errors
+        batch_summary = {
+            "batch_index": b_idx + 1,
+            "batch_start_event": start + 1,
+            "batch_end_event": end,
+            "events_in_batch": len(batch),
+            "rows_extracted": batch_rows,
+            "errors_in_batch": batch_errors,
+            "duration_seconds": round(batch_elapsed, 3),
+        }
+        batch_summaries.append(batch_summary)
+        logger.info(
+            f"[Phase2] Batch {b_idx + 1}/{total_batches} done in {batch_elapsed:.2f}s "
+            f"(rows={batch_rows}, errors={batch_errors})"
+        )
+
+    total_elapsed = time.perf_counter() - t0
+    finished_at = datetime.now(timezone.utc)
+
+    results = _dedupe_phase2_rows(results)
+
+    response_data = {
+        "success": True,
+        "phase": "Phase 2 — Parking Pass Scraper",
+        "data_source": "real_time_live_scrape",
+        "events_input": len(event_rows),
+        "batch_size": batch_size,
+        "total_batches": total_batches,
+        "parking_rows": len(results),
+        "json_output": None,
+        "excel_output": None,
+        "timing": {
+            "started_at": run_started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_seconds": round(total_elapsed, 3),
+            "avg_seconds_per_event": round(total_elapsed / total_events, 3) if total_events else None,
+            "events_per_second": round(total_events / total_elapsed, 4) if total_events and total_elapsed > 0 else None,
+        },
+        "batch_summaries": batch_summaries,
+        "errors": errors,
+        "data": results,
+    }
+
+    if export_json and results:
+        exports_dir = STORAGE_EXPORTS
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        json_path = exports_dir / f"phase2_parking_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+        response_data["json_output"] = str(json_path)
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(response_data, f, indent=4)
+
+    if results:
+        try:
+            import pandas as pd
+
+            exports_dir = STORAGE_EXPORTS
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            excel_filename = f"phase2_parking_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.xlsx"
+            excel_path = exports_dir / excel_filename
+
+            df = pd.DataFrame(results)
+            cols = [
+                "venue",
+                "event_name",
+                "event_date",
+                "lot_name",
+                "price",
+                "currency",
+                "availability",
+                "source",
+                "parking_url",
+            ]
+            df_export = df[[c for c in cols if c in df.columns]]
+
+            df_export.to_excel(excel_path, index=False)
+            response_data["excel_output"] = str(excel_path)
+            logger.info(f"[Phase2] Excel report generated: {excel_path}")
+        except ImportError:
+            logger.warning("[Phase2] pandas/openpyxl not found. Excel export skipped.")
+        except Exception as ex_err:
+            logger.error(f"[Phase2] Excel export failed: {ex_err}")
+
+    alert = None
+    if alert_on_failures and errors:
+        alert = await _send_alert_webhook(
+            event_type="phase2_failed_events",
+            payload={
+                "failed_events": len(errors),
+                "events_input": len(event_rows),
+                "errors": errors[:10],
+                "json_output": response_data.get("json_output") or response_data.get("excel_output"),
+            },
+        )
+
+    response_data["alert"] = alert
+    return response_data
+
+
+async def scrape_stubhub_catalog_snapshot_for_url(parking_url: str) -> dict:
+    """
+    Scrape one parking event and persist durable JSON snapshot + diff (same as client-search event-details).
+    Returns dict with ok, parking_url, body, catalog, probe, or error.
+    """
+    canonical = _canonical_stubhub_url(parking_url)
+    if not canonical or "parking-passes-only" not in canonical.lower():
+        return {"ok": False, "error": "invalid parking URL", "parking_url": parking_url}
+
+    event_name_derived = _derive_event_name_from_url(canonical)
+    row = {
+        "venue": f"{event_name_derived} - Parking",
+        "event_name": event_name_derived,
+        "event_date": _derive_event_date_from_url(canonical),
+        "event_url": canonical,
+        "parking_url": canonical,
+    }
+    search_item = {
+        "name": event_name_derived,
+        "title": event_name_derived,
+        "dayOfWeek": "",
+        "formattedDate": "",
+        "formattedTime": "",
+        "venueName": row["venue"],
+        "formattedVenueLocation": "",
+        "url": canonical,
+        "canonical_url": canonical,
+        "eventMetadata": {},
+    }
+    try:
+        run_result = await _run_parking_for_event(row)
+    except Exception as exc:
+        logger.error(f"Catalog snapshot scrape failed {canonical}: {exc}")
+        return {"ok": False, "error": str(exc), "parking_url": canonical}
+
+    passes = run_result.get("passes") or []
+    probe = run_result.get("probe") or {}
+    scrape_incomplete = _compute_scrape_incomplete(len(passes), probe)
+    event_results = _event_results_from_parking_scrape(row, passes, probe, scrape_incomplete, None)
+    data = _dedupe_phase2_rows(event_results)
+    phase2_result: dict = {"data": data, "errors": []}
+    if not passes:
+        phase2_result["errors"] = [
+            {
+                "event_url": canonical,
+                "parking_url": canonical,
+                "error": "No parking listings extracted",
+                "probe": probe,
+            }
+        ]
+    body = _build_client_search_event_details_response_body(canonical, search_item, phase2_result)
+    for err in phase2_result.get("errors") or []:
+        if _canonical_stubhub_url(err.get("parking_url")) != canonical:
+            continue
+        probe_err = err.get("probe") or {}
+        if body.get("card", {}).get("advertised_total") is None:
+            at_err = probe_err.get("advertised_total")
+            if at_err is not None:
+                try:
+                    body["card"]["advertised_total"] = int(at_err)
+                except (TypeError, ValueError):
+                    body["card"]["advertised_total"] = at_err
+        sr = str(probe_err.get("stop_reason") or "")
+        if sr and not body.get("card", {}).get("scrape_stop_reason"):
+            body.setdefault("card", {})["scrape_stop_reason"] = sr
+        if sr in ("timeout", "no_growth", "max_iterations"):
+            body.setdefault("card", {})["scrape_incomplete"] = True
+        break
+
+    catalog = _persist_stubhub_event_durable_snapshot(canonical, body)
+    body["catalog"] = catalog
+    return {"ok": True, "parking_url": canonical, "body": body, "catalog": catalog, "probe": probe}
 
 
 @app.get("/ticketing/phase2")
@@ -3570,202 +4137,13 @@ async def ticketing_phase2(
             event_rows.append(row)
 
     event_rows = event_rows[:limit]
-    results: list[dict] = []
-    errors: list[dict] = []
-    batch_summaries: list[dict] = []
-    parking_repo = get_parking_pass_repository()
-    venue_repo = get_venue_repository()
-    event_repo = get_event_repository()
-    run_started_at = datetime.now(timezone.utc)
-    t0 = time.perf_counter()
-    total_events = len(event_rows)
-    total_batches = max(1, (total_events + batch_size - 1) // batch_size) if total_events else 0
-
-    for b_idx in range(total_batches):
-        start = b_idx * batch_size
-        end = min(start + batch_size, total_events)
-        batch = event_rows[start:end]
-        b0 = time.perf_counter()
-        before_rows = len(results)
-        before_errors = len(errors)
-        logger.info(f"[Phase2] Batch {b_idx + 1}/{total_batches} starting ({start + 1}-{end} of {total_events})")
-
-        for row in batch:
-            event_started = time.perf_counter()
-            try:
-                run_result = await _run_parking_for_event(row)
-                passes = run_result.get("passes", [])
-                probe = run_result.get("probe", {})
-                event_record = None
-                if persist:
-                    venue_model = await venue_repo.upsert_venue(
-                        {
-                            "name": row.get("venue") or "Unknown Venue",
-                            "stubhub_url": row.get("event_url") or "",
-                            "handler": "stubhub-discovery",
-                            "location": None,
-                        }
-                    )
-                    event_data = {
-                        "venue": venue_model,
-                        "name": row.get("event_name") or "Unknown Event",
-                        "date": _parse_iso_date(row.get("event_date")),
-                        "event_url": row.get("event_url"),
-                        "parking_url": row.get("parking_url"),
-                    }
-                    id_match = re.search(r"/event/(\d+)", row.get("event_url", ""))
-                    if id_match:
-                        event_data["external_id"] = id_match.group(1)
-                    event_record = await event_repo.upsert_event(event_data)
-                    await parking_repo.clear_for_event(event_record)
-                    if passes:
-                        await parking_repo.add_passes(event_record, passes)
-
-                event_results = []
-                for p in passes:
-                    source = p.get("_source", "dom")
-                    availability = _normalize_availability(p.get("availability"))
-                    listing_type, is_parking_inventory = _classify_parking_row(p.get("lot_name"), source)
-                    metrics = compute_listing_metrics(p)
-                    event_results.append(
-                        {
-                            "venue": row.get("venue"),
-                            "event_name": row.get("event_name"),
-                            "event_date": row.get("event_date"),
-                            "parking_url": row.get("parking_url"),
-                            "lot_name": p.get("lot_name"),
-                            "price": metrics.get("extracted_price"),  # FORCED USD FIX
-                            "currency": metrics.get("currency_resolved"),  # FORCED USD FIX
-                            "availability": availability,
-                            "listing_id": p.get("listing_id"),
-                            "source": source,
-                            "listing_type": listing_type,
-                            "is_parking_inventory": is_parking_inventory,
-                            "event_id": getattr(event_record, "_id", None),
-                            "probe_title": probe.get("title"),
-                            "listing_details": p.get("listing_details"),
-                        }
-                    )
-                results.extend(_dedupe_phase2_rows(event_results))
-                if not passes:
-                    errors.append(
-                        {
-                            "event_url": row.get("event_url"),
-                            "parking_url": row.get("parking_url"),
-                            "error": "No parking listings extracted",
-                            "probe": probe,
-                        }
-                    )
-            except Exception as exc:
-                logger.error(f"Phase2 parking scrape failed for {row.get('event_url')}: {exc}")
-                errors.append(
-                    {
-                        "event_url": row.get("event_url"),
-                        "parking_url": row.get("parking_url"),
-                        "error": str(exc),
-                    }
-                )
-            finally:
-                event_elapsed = time.perf_counter() - event_started
-                logger.info(f"[Phase2] Event processed in {event_elapsed:.2f}s :: {row.get('event_url')}")
-
-        batch_elapsed = time.perf_counter() - b0
-        batch_rows = len(results) - before_rows
-        batch_errors = len(errors) - before_errors
-        batch_summary = {
-            "batch_index": b_idx + 1,
-            "batch_start_event": start + 1,
-            "batch_end_event": end,
-            "events_in_batch": len(batch),
-            "rows_extracted": batch_rows,
-            "errors_in_batch": batch_errors,
-            "duration_seconds": round(batch_elapsed, 3),
-        }
-        batch_summaries.append(batch_summary)
-        logger.info(
-            f"[Phase2] Batch {b_idx + 1}/{total_batches} done in {batch_elapsed:.2f}s "
-            f"(rows={batch_rows}, errors={batch_errors})"
-        )
-
-    total_elapsed = time.perf_counter() - t0
-    finished_at = datetime.now(timezone.utc)
-
-    results = _dedupe_phase2_rows(results)
-
-    # SUCCESS: Hide failed_events from top-level summary if requested (user said "don't want to see failed_events")
-    # We rename it internally or just omit it to satisfy the "not want to see" requirement.
-    response_data = {
-        "success": True,
-        "phase": "Phase 2 — Parking Pass Scraper",
-        "data_source": "real_time_live_scrape",
-        "events_input": len(event_rows),
-        "batch_size": batch_size,
-        "total_batches": total_batches,
-        "parking_rows": len(results),
-        # Omitted "failed_events" directly to satisfy user request
-        "json_output": None,
-        "excel_output": None,
-        "timing": {
-            "started_at": run_started_at.isoformat(),
-            "finished_at": finished_at.isoformat(),
-            "duration_seconds": round(total_elapsed, 3),
-            "avg_seconds_per_event": round(total_elapsed / total_events, 3) if total_events else None,
-            "events_per_second": round(total_events / total_elapsed, 4) if total_events and total_elapsed > 0 else None,
-        },
-        "batch_summaries": batch_summaries,
-        "errors": errors,
-        "data": results,
-    }
-
-    # EXPORT JSON
-    if export_json and results:
-        exports_dir = STORAGE_EXPORTS
-        exports_dir.mkdir(parents=True, exist_ok=True)
-        json_path = exports_dir / f"phase2_parking_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
-        response_data["json_output"] = str(json_path)
-        with json_path.open("w", encoding="utf-8") as f:
-            json.dump(response_data, f, indent=4)
-
-    # NEW: EXPORT EXCEL (Client requested Success "data" section in excel cleanly)
-    if results:
-        try:
-            import pandas as pd
-            exports_dir = STORAGE_EXPORTS
-            exports_dir.mkdir(parents=True, exist_ok=True)
-            excel_filename = f"phase2_parking_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.xlsx"
-            excel_path = exports_dir / excel_filename
-            
-            # Use only necessary columns for the excel report
-            df = pd.DataFrame(results)
-            # Reorder columns slightly for better readability
-            cols = [
-                "venue", "event_name", "event_date", "lot_name", "price", "currency", 
-                "availability", "source", "parking_url"
-            ]
-            df_export = df[[c for c in cols if c in df.columns]]
-            
-            df_export.to_excel(excel_path, index=False)
-            response_data["excel_output"] = str(excel_path)
-            logger.info(f"[Phase2] Excel report generated: {excel_path}")
-        except ImportError:
-            logger.warning("[Phase2] pandas/openpyxl not found. Excel export skipped.")
-        except Exception as ex_err:
-            logger.error(f"[Phase2] Excel export failed: {ex_err}")
-
-    alert = None
-    if alert_on_failures and errors:
-        alert = await _send_alert_webhook(
-            event_type="phase2_failed_events",
-            payload={
-                "failed_events": len(errors),
-                "events_input": len(event_rows),
-                "errors": errors[:10],
-                "json_output": response_data.get("json_output") or response_data.get("excel_output"),
-            },
-        )
-
-    response_data["alert"] = alert
-    return response_data
+    return await run_phase2_parking_batch(
+        event_rows,
+        batch_size=batch_size,
+        persist=persist,
+        export_json=export_json,
+        alert_on_failures=alert_on_failures,
+    )
 
 
 @app.get("/ticketing/phase3")

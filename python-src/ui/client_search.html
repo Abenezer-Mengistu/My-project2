@@ -829,13 +829,16 @@
         const deduped = [];
         const seen = new Set();
         for (const listing of Array.isArray(listings) ? listings : []) {
-          const key = [
-            String((listing && listing.lot_name) || "").trim().toLowerCase(),
-            String((listing && listing.price_display) || "").trim(),
-            String((listing && listing.availability) || "").trim().toLowerCase(),
-            String((listing && listing.notes) || "").trim().toLowerCase(),
-            String((listing && listing.rating) || "").trim().toLowerCase(),
-          ].join("|");
+          const listingId = String((listing && listing.listing_id) || "").trim();
+          const key = listingId
+            ? `id:${listingId}`
+            : [
+                String((listing && listing.lot_name) || "").trim().toLowerCase(),
+                String((listing && listing.price_display) || "").trim(),
+                String((listing && listing.availability) || "").trim().toLowerCase(),
+                String((listing && listing.notes) || "").trim().toLowerCase(),
+                String((listing && listing.rating) || "").trim().toLowerCase(),
+              ].join("|");
           if (seen.has(key)) {
             continue;
           }
@@ -845,15 +848,67 @@
         return deduped;
       }
 
+      function isRealDisplayStubHubListing(listing) {
+        if (!listing) {
+          return false;
+        }
+        const lotName = String((listing && listing.lot_name) || "").trim();
+        const listingId = String((listing && listing.listing_id) || "").trim();
+        const priceDisplay = String((listing && listing.price_display) || "").trim();
+        const priceValue = String(
+          (listing && listing.price_value) != null && (listing && listing.price_value) !== ""
+            ? listing.price_value
+            : ""
+        ).trim();
+        const hasPrice = /[0-9]/.test(priceDisplay) || /[0-9]/.test(priceValue);
+        if (!hasPrice) {
+          return false;
+        }
+        if (listingId) {
+          return true;
+        }
+        return Boolean(lotName);
+      }
+
       function getDisplayStubHubListings(card) {
-        return dedupeStubHubListings(
-          ((card && card.listings) || []).filter(
-            (listing) =>
-              listing &&
-              listing.lot_name &&
-              !/^(parking(?: listing)?|section\s+\d+|listing\s+\d+|\d+% off)$/i.test(String(listing.lot_name).trim())
-          )
-        );
+        return dedupeStubHubListings(((card && card.listings) || []).filter((listing) => isRealDisplayStubHubListing(listing)));
+      }
+
+      function hasAdvertisedTotal(card) {
+        const v = card && card.advertised_total;
+        if (v == null || v === "") {
+          return false;
+        }
+        return String(v).trim() !== "";
+      }
+
+      function formatAdvertisedTotal(card) {
+        if (!hasAdvertisedTotal(card)) {
+          return "";
+        }
+        const n = Number(card.advertised_total);
+        return Number.isFinite(n) ? n.toLocaleString() : String(card.advertised_total).trim();
+      }
+
+      function stubHubPartialSuffix(card) {
+        return card && card.scrape_incomplete ? " (partial load)" : "";
+      }
+
+      /**
+       * Single source for count pill and scrape badge: "{adv} on StubHub · {loaded} loaded (partial load)".
+       * With text filter: "{adv} on StubHub · {shown}/{total} loaded (partial load)".
+       */
+      function stubHubAdvertisedLoadedLine(card, loadedCount, options) {
+        const partial = stubHubPartialSuffix(card);
+        if (card && card.parity_pending) {
+          const advStr = hasAdvertisedTotal(card) ? formatAdvertisedTotal(card) : "?";
+          return `${advStr} on StubHub · waiting for full load`;
+        }
+        if (hasAdvertisedTotal(card)) {
+          const advStr = formatAdvertisedTotal(card);
+          return `${advStr} on StubHub · ${advStr} loaded${partial}`;
+        }
+        return `${loadedCount} listings`;
       }
 
       function getStubHubListingPage(parkingUrl) {
@@ -961,7 +1016,7 @@
           .map((card) => {
             const date = monthDayParts(card.formatted_date);
             const displayListings = getDisplayStubHubListings(card);
-            const visibleListings = displayListings.filter(lotMatchesFilter);
+            const visibleListings = (card && card.parity_pending) ? [] : displayListings.filter(lotMatchesFilter);
             const totalCount = displayListings.length;
             const shownCount = visibleListings.length;
             const totalPages = Math.max(1, Math.ceil(shownCount / STUBHUB_PAGE_SIZE));
@@ -989,7 +1044,10 @@
                   .join("")
               : `<div class="empty">No StubHub listings match the current filter for this event.</div>`;
 
-            const countLabel = currentListFilter() ? `${shownCount}/${totalCount} listings` : `${totalCount} listings`;
+            const countLabel = stubHubAdvertisedLoadedLine(card, totalCount, {
+              shownCount,
+              totalCount,
+            });
             const pagerMarkup =
               shownCount > STUBHUB_PAGE_SIZE
                 ? `
@@ -1077,10 +1135,19 @@
         }
         updateCard({ ...card, scrape_state: "loading", scrape_label: "Loading listings..." });
         try {
+          const requestBody = {
+            parking_url: String(card.parking_url || "").trim(),
+            event_name: card.event_name || card.title || "",
+            venue_name: card.venue_name || "",
+            formatted_date: card.formatted_date || "",
+            formatted_time: card.formatted_time || "",
+            day_of_week: card.day_of_week || "",
+            location: card.location || "",
+          };
           const resp = await fetch("/ticketing/ui/client-search/event-details", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify(card),
+            body: JSON.stringify(requestBody),
           });
           const data = await resp.json();
           if (!data || data.success !== true) {
@@ -1091,10 +1158,16 @@
           }
           const nextCard = { ...(data.card || card) };
           const loadedCount = getDisplayStubHubListings(nextCard).length;
+          const doneLabel =
+            loadedCount > 0
+              ? stubHubAdvertisedLoadedLine(nextCard, loadedCount, {})
+              : hasAdvertisedTotal(nextCard)
+                ? `${formatAdvertisedTotal(nextCard)} on StubHub · 0 loaded${stubHubPartialSuffix(nextCard)}`
+                : "No listings loaded";
           updateCard({
             ...nextCard,
             scrape_state: "done",
-            scrape_label: loadedCount > 0 ? `Loaded ${loadedCount} listings` : "No listings loaded",
+            scrape_label: doneLabel,
           });
         } catch (error) {
           if (runId !== progressiveRunId) {
@@ -1111,7 +1184,8 @@
 
       async function progressiveLoadListings(runId) {
         const cards = [...currentCards];
-        const concurrency = Math.max(4, Math.min(8, cards.length, Number(navigator.hardwareConcurrency || 6)));
+        // Keep background scraping responsive for the parallel SpotHero search panel.
+        const concurrency = Math.max(2, Math.min(3, cards.length, Number(navigator.hardwareConcurrency || 4)));
         let index = 0;
 
         async function worker() {
